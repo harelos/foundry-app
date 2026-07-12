@@ -1,0 +1,39 @@
+# Foundry — files that must never leave your machine
+
+# User data & session state (contains API keys in plain text)
+data.json
+data.json.bak
+templates.json
+
+# The Reel data store — holds Anthropic + Higgsfield API keys in plain text
+reel-data.json
+reel-data.json.bak
+
+# Local tooling config (preview launch config, permissions, etc.)
+.claude/
+
+# Uploads land inside project folders
+mc-uploads/
+
+# Node & OS
+node_modules/
+*.log
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Mac / Windows junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Credentials backups (from account switcher)
+credentials-backups/
+*.credentials.json
+
+# Per-account Claude login profiles (also live outside the repo, in ~/.foundry-accounts)
+.foundry-accounts/
