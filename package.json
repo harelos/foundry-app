@@ -10,7 +10,7 @@
     "desktop": "electron .",
     "test": "node --test test/*.test.js",
     "pack": "electron-builder --dir",
-    "dist:win": "electron-builder --win nsis",
+    "dist:win": "electron-builder --win nsis --publish never",
     "site": "node scripts/serve-site.js"
   },
   "author": "Tiger Brands Global",
