@@ -1011,7 +1011,6 @@ const server = http.createServer(async (req, res) => {
       return json(res, 409, { error: `Connect ${body.provider === 'claude' ? 'Claude' : 'Codex'} before creating the team.`, code: 'provider_not_connected' });
     }
     try {
-      startTrial(state.meta);
       const project = createOutcomeProject({
         name: body.projectName,
         cwd: body.cwd,
@@ -1331,6 +1330,7 @@ const server = http.createServer(async (req, res) => {
       mission.status = 'accepted';
       mission.acceptedAt = Date.now();
       mission.artifacts = Array.from(new Set([...(mission.artifacts || []), deliverablePath]));
+      startTrial(state.meta);
       state.meta.activatedAt = state.meta.activatedAt || Date.now();
       saveData();
       return json(res, 200, { ok: true, mission, deliverablePath });

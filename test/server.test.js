@@ -97,6 +97,16 @@ test('server stays on loopback and never serializes agent keys', async (t) => {
   assert.equal(imported.ok, true);
   assert.equal(imported.project.mission.status, 'ready');
   assert.equal(imported.state.agents.filter((agent) => agent.projectId === imported.project.id).length, 2);
+  assert.equal(Boolean(JSON.parse(fs.readFileSync(path.join(dataDir, 'data.json'), 'utf8')).meta.trialStartedAt), false);
+
+  fs.writeFileSync(path.join(imported.project.cwd, imported.project.deliverable), '# Reviewable result\n');
+  response = await fetch(`${base}/api/projects/${imported.project.id}/accept`, {
+    method: 'POST',
+    headers: { Cookie: cookie },
+  });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).mission.status, 'accepted');
+  assert.equal(Boolean(JSON.parse(fs.readFileSync(path.join(dataDir, 'data.json'), 'utf8')).meta.trialStartedAt), true);
 
   const status = await fetch(`${base}/api/health`, { headers: { 'x-foundry-token': token } });
   assert.equal(status.headers.get('x-frame-options'), 'DENY');

@@ -76,7 +76,7 @@ Foundry sends selected context to the provider the user chooses; "local" does no
 - **Pro:** proposed at $29/month or $249/year, with saved projects, up to eight workers, reusable outcomes, and two-provider continuity.
 - **Studio:** proposed at $79/month after team demand and capacity are proven.
 
-Every install starts with a 14-day no-card Pro feature trial, then remains useful on Free Local. Provider usage is billed by the provider and is never advertised as unlimited.
+The 14-day no-card Pro feature trial starts when the first promised outcome is opened and accepted, not while the user is still setting up. Afterward the install remains useful on Free Local. Provider usage is billed by the provider and is never advertised as unlimited.
 
 ## Repository map
 
