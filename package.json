@@ -1,13 +1,58 @@
 {
-  "name": "mission-control",
-  "version": "2.1.0",
-  "description": "Multi-agent dashboard for Claude Code and any OpenAI-compatible LLM. Run 20+ agents simultaneously with per-agent model/provider selection.",
-  "main": "server.js",
+  "name": "foundry-desktop",
+  "productName": "Foundry",
+  "version": "0.9.0",
+  "description": "An outcome operating system for business operators using Claude and Codex.",
+  "main": "desktop/main.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "desktop": "electron .",
+    "test": "node --test test/*.test.js",
+    "pack": "electron-builder --dir",
+    "dist:win": "electron-builder --win nsis --publish never",
+    "site": "node scripts/serve-site.js"
   },
-  "author": "",
+  "author": "Tiger Brands Global",
   "license": "MIT",
-  "private": true
+  "private": true,
+  "devDependencies": {
+    "electron": "^38.2.1",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.foundry.work",
+    "productName": "Foundry",
+    "asar": true,
+    "files": [
+      "desktop/**/*",
+      "core/**/*",
+      "public/**/*",
+      "server.js",
+      "package.json",
+      "LICENSE"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "icon": "build/icon.png",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "artifactName": "Foundry-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Foundry",
+      "deleteAppDataOnUninstall": false
+    }
+  }
 }

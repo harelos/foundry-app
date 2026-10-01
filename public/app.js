@@ -60,7 +60,7 @@ const cards = new Map();
 let editingAgentId = null;
 let editingTemplate = null;
 let focusedAgentId = null;
-let currentView = 'chat';       // chat | log | diagram | reel
+let currentView = 'chat';       // chat | log | diagram
 let currentLayout = 'focus';    // focus | grid
 const missionLogEntries = [];
 const activityFeed = [];
@@ -148,6 +148,20 @@ function renderProjectBar() {
   const proj = activeProject();
   $('pName').textContent = proj ? proj.name : 'No project';
   $('pCwd').textContent = proj ? proj.cwd : '';
+  const review = $('reviewOutcomeBtn');
+  review.classList.toggle('hidden', !(proj && proj.deliverable));
+  review.textContent = proj && proj.mission && proj.mission.status === 'accepted' ? 'Outcome accepted' : 'Review outcome';
+  review.disabled = !!(proj && proj.mission && proj.mission.status === 'accepted');
+  review.title = proj && proj.deliverable ? `Expected file: ${proj.deliverable}` : '';
+  review.onclick = async () => {
+    if (!proj || !proj.deliverable) return;
+    const mission = await api('/api/projects/' + proj.id + '/mission');
+    const accepted = confirm('Review the deliverable in your workspace first:\n\n' + proj.cwd + '\n' + proj.deliverable + '\n\nDoes it meet the acceptance checklist?');
+    if (!accepted) return;
+    const result = await api('/api/projects/' + proj.id + '/accept', 'POST');
+    if (!result.ok) { alert(result.error || 'The deliverable is not ready yet.'); return; }
+    await refresh();
+  };
   const pf = $('pFiles'); pf.innerHTML = '';
   if (proj) (proj.contextFiles || []).forEach((f) => {
     const chip = el('div', 'chip');
@@ -207,17 +221,14 @@ function renderCenter() {
   const grid = $('gridView');
   const log = $('missionLog');
   const diag = $('diagram');
-  const reel = $('reelView');
 
   ws.classList.add('hidden');
   grid.classList.add('hidden');
   log.classList.add('hidden');
   diag.classList.add('hidden');
-  reel.classList.add('hidden');
 
   if (currentView === 'log') { renderMissionLog(); log.classList.remove('hidden'); return; }
   if (currentView === 'diagram') { renderDiagram(); diag.classList.remove('hidden'); return; }
-  if (currentView === 'reel') { window.ReelUI && window.ReelUI.render(reel); reel.classList.remove('hidden'); return; }
 
   // chat view
   if (currentLayout === 'grid') {
@@ -792,6 +803,22 @@ function addErrorCard(c, text) {
     retry.onclick = () => doSend(c.meta.id, c._lastUserText);
     card.append(retry);
   }
+  if (/weekly limit|usage limit|rate.?limit|quota|resets? at|not logged|unauthenticated|login required/i.test(text || '')) {
+    const failover = el('button', 'ec-retry', 'Continue with other connected plan');
+    failover.onclick = async () => {
+      failover.disabled = true;
+      failover.textContent = 'Checking connection…';
+      const result = await api('/api/agents/' + c.meta.id + '/failover', 'POST');
+      if (!result.ok) {
+        failover.textContent = result.error || 'Connect the other provider first';
+        failover.disabled = false;
+        return;
+      }
+      failover.textContent = 'Switched. Continue';
+      await refresh();
+    };
+    card.append(failover);
+  }
   c.transcript.appendChild(card);
   maybeScroll(c);
 }
@@ -839,6 +866,7 @@ function renderServerMsg(c, m, live) {
     }
     case 'result': break;   // per-turn cost lives in the header total now (no clutter lines)
     case 'stopped': c._statusGroup = null; addMsg(c, 'system', '■ Stopped by you'); break;
+    case 'system': c._statusGroup = null; addMsg(c, 'system', m.text || 'System update'); break;
     case 'error': c._statusGroup = null; addErrorCard(c, m.text); break;
   }
 }
@@ -968,7 +996,7 @@ function renderEvent(c, evt) {
       }
       break;
     case 'error':
-      addMsg(c, 'err', evt.error);
+      addErrorCard(c, evt.error);
       logEvent(c.meta.id, 'error', evt.error);
       break;
   }
@@ -1138,11 +1166,8 @@ function fillModelOptions(sel, currentVal) {
 }
 function syncEngineFields() {
   const eng = $('wmEngine').value;
-  $('wmApiFields').classList.toggle('hidden', eng !== 'api');
   $('wmCcFields').classList.toggle('hidden', eng !== 'claude-code');
-  $('wmOcFields').classList.toggle('hidden', eng !== 'openclaw');
   $('wmCodexFields').classList.toggle('hidden', eng !== 'codex');
-  $('wmHermesFields').classList.toggle('hidden', eng !== 'hermes');
 }
 function openWorker(id, presetReports) {
   editingAgentId = id || null;
@@ -1155,39 +1180,8 @@ function openWorker(id, presetReports) {
   fillModelOptions($('wmModel'), a ? a.model : '');
   $('wmEffort').value = a ? (a.effort || '') : '';
   $('wmEngine').value = a ? (a.engine || 'claude-code') : 'claude-code';
-  $('wmApiBase').value = a ? (a.apiBaseUrl || '') : '';
-  $('wmApiKey').value = a ? (a.apiKey || '') : '';
-  $('wmApiModel').value = a ? (a.apiModel || '') : '';
-  $('wmCcBase').value = a ? (a.ccBaseUrl || '') : '';
-  $('wmCcToken').value = a ? (a.ccAuthToken || '') : '';
-  $('wmCcModel').value = a ? (a.ccModel || '') : '';
-  $('wmCcOauth').value = a ? (a.ccOauthToken || '') : '';
-  $('wmOcProvider').value = a ? (a.ocProvider || '') : '';
-  $('wmOcModel').value = a ? (a.ocModel || '') : '';
-  $('wmOcApiKey').value = a ? (a.ocApiKey || '') : '';
   $('wmCodexModel').value = a ? (a.codexModel || '') : '';
-  $('wmCodexApiKey').value = a ? (a.codexApiKey || '') : '';
-  $('wmHermesProvider').value = a ? (a.hermesProvider || '') : '';
-  $('wmHermesModel').value = a ? (a.hermesModel || '') : '';
-  $('wmHermesApiKey').value = a ? (a.hermesApiKey || '') : '';
   $('wmSoul').value = a ? a.soul : '';
-  $('wmCcOauthGet').onclick = async () => {
-    const btn = $('wmCcOauthGet');
-    btn.disabled = true; btn.textContent = 'Authorize in browser…';
-    try {
-      const r = await api('/api/account/setup-token', 'POST');
-      if (r.token) {
-        $('wmCcOauth').value = r.token;
-        btn.textContent = 'Token captured ✓';
-        setTimeout(() => { btn.textContent = 'Get token'; btn.disabled = false; }, 2000);
-      } else {
-        alert('No token captured yet.' + (r.url ? '\n\nOpen this URL, click Authorize, then press Get token again:\n' + r.url : '\n\nMake sure you click Authorize in the browser, then try again.'));
-        btn.textContent = 'Get token'; btn.disabled = false;
-      }
-    } catch (e) {
-      alert('Failed: ' + (e.message || e)); btn.textContent = 'Get token'; btn.disabled = false;
-    }
-  };
   syncEngineFields();
   openModal('workerModal');
 }
@@ -1197,11 +1191,7 @@ async function saveWorker() {
     name: $('wmName').value.trim(), role: $('wmName').value.trim(),
     reportsTo: $('wmReports').value, model: $('wmModel').value, accountId: $('wmAccount').value,
     effort: $('wmEffort').value, soul: $('wmSoul').value, engine: $('wmEngine').value,
-    apiBaseUrl: $('wmApiBase').value.trim(), apiKey: $('wmApiKey').value.trim(), apiModel: $('wmApiModel').value.trim(),
-    ccBaseUrl: $('wmCcBase').value.trim(), ccAuthToken: $('wmCcToken').value.trim(), ccModel: $('wmCcModel').value.trim(), ccOauthToken: $('wmCcOauth').value.trim(),
-    ocProvider: $('wmOcProvider').value.trim(), ocModel: $('wmOcModel').value.trim(), ocApiKey: $('wmOcApiKey').value.trim(),
-    codexModel: $('wmCodexModel').value.trim(), codexApiKey: $('wmCodexApiKey').value.trim(),
-    hermesProvider: $('wmHermesProvider').value.trim(), hermesModel: $('wmHermesModel').value.trim(), hermesApiKey: $('wmHermesApiKey').value.trim(),
+    codexModel: $('wmCodexModel').value.trim(),
   };
   if (editingAgentId) await api('/api/agents/' + editingAgentId + '/edit', 'POST', body);
   else await api('/api/agents', 'POST', { ...body, projectId: proj.id });
@@ -1318,7 +1308,6 @@ function applyViewButtons() {
   $('viewChat').classList.toggle('on', currentView === 'chat');
   $('viewLog').classList.toggle('on', currentView === 'log');
   $('viewDiagram').classList.toggle('on', currentView === 'diagram');
-  $('viewReel').classList.toggle('on', currentView === 'reel');
 }
 function applyLayoutButtons() {
   document.querySelectorAll('#layoutBar button').forEach((b) => b.classList.toggle('on', b.dataset.layout === currentLayout));
@@ -1664,32 +1653,49 @@ async function renderUsage() {
 // ---- Account ----
 let lastAccount = null;
 async function fetchAccount() {
-  // Header no longer shows a single "logged in as" (misleading with multiple accounts).
-  // We just fetch the machine login for the Account Management modal.
   const badge = $('accountBadge');
   try {
-    lastAccount = await api('/api/account');
-    if (badge) badge.classList.toggle('ok', !!lastAccount.logged_in);
+    const status = await api('/api/system/status');
+    const providers = Object.values(status.providers || {});
+    lastAccount = { logged_in: providers.some((provider) => provider.connected) };
+    if (badge) {
+      badge.classList.toggle('ok', lastAccount.logged_in);
+      const label = badge.querySelector('.acct-email');
+      if (label) label.textContent = providers.filter((provider) => provider.connected).map((provider) => provider.name).join(' + ') || 'Connect';
+    }
   } catch { lastAccount = null; }
 }
 async function openAccountModal() {
   $('accountModal').classList.add('open');
-  await fetchAccount();
   const info = $('acctInfo');
-  if (lastAccount && lastAccount.logged_in) {
-    info.innerHTML = '<div style="display:flex;flex-direction:column;gap:4px">'
-      + '<div style="font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Logged in as</div>'
-      + '<div style="font-size:16px;font-weight:700;color:var(--accent2)">' + esc(lastAccount.email || '—') + '</div>'
-      + (lastAccount.org ? '<div style="font-size:12px;color:var(--muted)">Org: ' + esc(lastAccount.org) + '</div>' : '')
-      + '<div style="font-size:12px;color:var(--muted)">Plan: ' + esc(lastAccount.plan || '—') + '</div>'
-      + '</div>';
-    $('acctLogout').style.display = '';
-  } else {
-    info.innerHTML = '<div style="color:var(--err)">Not logged in</div>';
-    $('acctLogout').style.display = 'none';
-  }
-  loadBackups();
-  renderVault();
+  info.innerHTML = '<div style="color:var(--muted);font-size:13px">Checking official CLI connections…</div>';
+  const status = await api('/api/system/status');
+  info.innerHTML = '';
+  Object.values(status.providers || {}).forEach((provider) => {
+    const row = el('div', 'vault-row');
+    const col = el('div'); col.style.cssText = 'display:flex;flex-direction:column;gap:4px;min-width:0';
+    col.append(el('div', 'v-name', provider.name));
+    const details = el('div', 'v-tok', provider.connected ? ('Connected' + (provider.account ? ' · ' + provider.account : '')) : (provider.installed ? 'Installed · sign-in required' : 'Not installed'));
+    details.style.color = provider.connected ? 'var(--accent2)' : 'var(--muted)';
+    col.append(details); row.append(col);
+    const action = el('button', 'icon-btn', provider.connected ? 'Ready' : (provider.installed ? 'Connect' : 'Install'));
+    action.disabled = provider.connected;
+    action.onclick = async () => {
+      if (!provider.installed) {
+        if (window.foundryDesktop) window.foundryDesktop.openExternal(provider.installUrl);
+        else window.open(provider.installUrl, '_blank', 'noopener');
+        return;
+      }
+      action.disabled = true; action.textContent = 'Opening…';
+      await api('/api/providers/' + provider.id + '/login', 'POST');
+      setTimeout(openAccountModal, 4000);
+    };
+    row.append(action); info.append(row);
+  });
+  const refreshButton = el('button', 'icon-btn', 'Re-check connections');
+  refreshButton.style.marginTop = '12px';
+  refreshButton.onclick = openAccountModal;
+  info.append(refreshButton);
 }
 async function loadBackups() {
   const r = await api('/api/account/backups');
@@ -1866,12 +1872,28 @@ function renderCmdk() {
 $('projSelect').onchange = async (e) => { if (e.target.value) { await api('/api/projects/' + e.target.value + '/activate', 'POST'); refresh(); } };
 $('newProjBtn').onclick = openNewProject;
 $('tplBtn').onclick = openTemplates;
+$('importMissionBtn').onclick = () => $('importMissionInput').click();
+$('importMissionInput').onchange = async () => {
+  const file = $('importMissionInput').files && $('importMissionInput').files[0];
+  $('importMissionInput').value = '';
+  if (!file) return;
+  try {
+    const mission = JSON.parse(await file.text());
+    if (mission.schema !== 'foundry.mission.v1') throw new Error('This is not a Foundry mission file.');
+    const name = mission.project && mission.project.name || 'Imported mission';
+    const objective = mission.objective || '';
+    if (!confirm('Import this mission without running it yet?\n\n' + name + '\n\n' + objective.slice(0, 500))) return;
+    const result = await api('/api/missions/import', 'POST', { mission });
+    if (!result.ok) throw new Error(result.error || 'Import failed');
+    await refresh();
+    setView('diagram');
+  } catch (error) { alert(error.message || String(error)); }
+};
 $('usageBtn').onclick = openUsageModal;
 $('cmdkTrigger').onclick = () => openCmdk('');
 $('viewChat').onclick = () => setView('chat');
 $('viewLog').onclick = () => setView('log');
 $('viewDiagram').onclick = () => setView('diagram');
-$('viewReel').onclick = () => setView('reel');
 $('addWorkerBtn').onclick = () => openWorker(null);
 $('saveTplBtn').onclick = saveProjectAsTemplate;
 $('addFileBtn').onclick = () => $('fileInput').click();

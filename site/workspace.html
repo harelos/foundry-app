@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Build a Foundry mission</title>
+  <meta name="description" content="Prepare a structured mission for Foundry Desktop without giving a website access to your computer.">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body class="planner-body">
+  <nav class="nav planner-nav"><a class="brand" href="./"><span class="brand-mark">F</span><span>Foundry</span></a><div class="nav-links"><a href="./">Back to site</a></div></nav>
+  <main class="planner">
+    <div class="eyebrow">Web mission builder</div>
+    <h1>Give the desktop a clear job before you install anything.</h1>
+    <p class="planner-lead">This page prepares a local mission file. It cannot read your computer, run commands, or contact Claude or Codex. Your draft stays in this browser until you export it.</p>
+    <form class="planner-form" id="missionForm">
+      <div class="planner-field"><label for="outcome">Outcome</label><select id="outcome"><option value="campaign_review">Client campaign review</option><option value="landing_page">Landing page launch</option><option value="store_audit">Store conversion audit</option><option value="content_sprint">Content sprint</option><option value="weekly_ops">Weekly operations review</option></select></div>
+      <div class="planner-field"><label for="projectName">Project name</label><input id="projectName" required placeholder="Acme October campaign"></div>
+      <div class="planner-field"><label for="objective">What should be true when the work is finished?</label><textarea id="objective" required placeholder="A client-ready campaign pack is open, reviewed, and ready for our Friday call."></textarea></div>
+      <div class="planner-field"><label for="evidence">What evidence and source material do you already have?</label><textarea id="evidence" placeholder="Product facts, current offer, customer research, past campaigns, brand guide, analytics exports…"></textarea></div>
+      <div class="planner-field"><label for="constraints">What must the team preserve or avoid?</label><textarea id="constraints" placeholder="Keep approved pricing. Do not publish. Do not invent testimonials. Use US English."></textarea></div>
+      <div class="planner-field"><label for="deadline">Review deadline</label><input id="deadline" type="date"></div>
+      <div class="planner-actions"><button class="button" type="submit">Preview mission</button><button class="button secondary" type="button" id="exportBtn" disabled>Export for Foundry Desktop</button><span class="planner-note" id="saveState">Draft saved in this browser</span></div>
+    </form>
+    <section class="preview" id="preview" hidden><div class="eyebrow">Import preview</div><h2>The desktop will ask you to approve this before execution.</h2><pre id="previewText"></pre></section>
+  </main>
+  <script src="./workspace.js"></script>
+</body>
+</html>
