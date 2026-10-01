@@ -2,6 +2,9 @@ name: Build Windows pilot
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - codex/production-launch
 
 permissions:
   contents: read
@@ -36,4 +39,3 @@ jobs:
             dist/Foundry-Setup-*.exe.blockmap
           if-no-files-found: error
           retention-days: 14
-
