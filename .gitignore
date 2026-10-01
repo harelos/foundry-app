@@ -1,11 +1,11 @@
 # Foundry — files that must never leave your machine
 
-# User data & session state (contains API keys in plain text)
+# User data & session state
 data.json
 data.json.bak
 templates.json
 
-# The Reel data store — holds Anthropic + Higgsfield API keys in plain text
+# Legacy private-build state files are never shipped
 reel-data.json
 reel-data.json.bak
 
@@ -17,7 +17,9 @@ mc-uploads/
 
 # Node & OS
 node_modules/
+dist/
 *.log
+*.tmp
 .env
 .env.local
 

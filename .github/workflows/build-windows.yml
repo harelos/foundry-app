@@ -1,0 +1,39 @@
+name: Build Windows pilot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - name: Build installer
+        run: npm run dist:win
+        env:
+          CSC_LINK: ${{ secrets.WINDOWS_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}
+      - name: Verify installer exists
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem dist\Foundry-Setup-*.exe | Select-Object -First 1
+          if (-not $installer) { throw "Installer was not created" }
+          Get-FileHash $installer.FullName -Algorithm SHA256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: foundry-windows-pilot
+          path: |
+            dist/Foundry-Setup-*.exe
+            dist/Foundry-Setup-*.exe.blockmap
+          if-no-files-found: error
+          retention-days: 14
+

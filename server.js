@@ -7,21 +7,26 @@ const { spawn } = require('child_process');
 const { randomUUID } = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { ensureMeta, startTrial, entitlementFor, canCreateProject, canCreateWorker } = require('./core/entitlements');
+const { allProviderStatuses, launchProviderLogin, classifyProviderFailure, findProviderFailure, alternateEngine, providerCommand } = require('./core/providers');
+const { getOutcome, publicOutcomes } = require('./core/outcomes');
 
-const PORT = process.env.MC_PORT || 4319;   // DEV sandbox (staging=4318, official=4317)
+const PORT = Number(process.env.MC_PORT || 4319);
+const HOST = process.env.MC_HOST || '127.0.0.1';
 const DEFAULT_CWD = process.env.MC_PROJECT_DIR || process.cwd();
-const PERMISSION_MODE = process.env.MC_PERMISSION_MODE || 'bypassPermissions';
+const PERMISSION_MODE = process.env.MC_PERMISSION_MODE || 'acceptEdits';
+const DATA_DIR = process.env.MC_DATA_DIR || __dirname;
+const LOCAL_TOKEN = process.env.MC_LOCAL_TOKEN || '';
+const ALLOWED_ENGINES = new Set(['claude-code', 'codex']);
 
-const DATA_FILE = path.join(__dirname, 'data.json');
-const TEMPLATES_FILE = path.join(__dirname, 'templates.json');
+fs.mkdirSync(DATA_DIR, { recursive: true });
+const DATA_FILE = path.join(DATA_DIR, 'data.json');
+const TEMPLATES_FILE = path.join(DATA_DIR, 'templates.json');
 // Each Vault account gets its own isolated Claude config dir here (Multi-Claude model).
 const ACCOUNTS_BASE = path.join(process.env.USERPROFILE || process.env.HOME || __dirname, '.foundry-accounts');
 
-// The Reel — mini-app router
-const reel = require('./reel');
-
 // ---------- State ----------
-let state = { projects: [], activeProjectId: null, nextNum: 1, accounts: [] };
+let state = { projects: [], activeProjectId: null, nextNum: 1, accounts: [], meta: {} };
 let templates = [];
 const agents = new Map(); // id -> agent (runtime + persisted)
 
@@ -45,14 +50,23 @@ function loopTick(agent) {
 }
 
 // ---------- Persistence ----------
+function readJsonWithBackup(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch (primaryError) {
+    try { return JSON.parse(fs.readFileSync(`${file}.bak`, 'utf8')); }
+    catch { throw primaryError; }
+  }
+}
+
 function loadAll() {
   try {
     if (fs.existsSync(DATA_FILE)) {
-      const d = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+      const d = readJsonWithBackup(DATA_FILE);
       state.projects = d.projects || [];
       state.activeProjectId = d.activeProjectId || null;
       state.nextNum = d.nextNum || 1;
       state.accounts = d.accounts || [];
+      state.meta = ensureMeta(d.meta || {});
       (d.agents || []).forEach((a) => {
         a.busy = false;
         a.totals = a.totals || newTotals();
@@ -66,6 +80,8 @@ function loadAll() {
       });
     }
   } catch (e) { console.log('  (could not load data.json:', e.message, ')'); }
+
+  state.meta = ensureMeta(state.meta || {});
 
   try {
     if (fs.existsSync(TEMPLATES_FILE)) {
@@ -89,30 +105,44 @@ function saveData() {
     projects: state.projects,
     activeProjectId: state.activeProjectId,
     nextNum: state.nextNum,
-    accounts: state.accounts,
+    meta: state.meta,
+    accounts: state.accounts.map((account) => ({
+      id: account.id,
+      name: account.name,
+      color: account.color,
+      provider: account.provider,
+      configDir: account.configDir,
+    })),
     agents: [...agents.values()].map((a) => ({
       id: a.id, num: a.num, name: a.name, role: a.role, soul: a.soul,
       model: a.model, effort: a.effort, reportsTo: a.reportsTo, projectId: a.projectId,
       cwd: a.cwd, sessionId: a.sessionId, totals: a.totals, primedSoul: a.primedSoul,
       accountId: a.accountId,
-      engine: a.engine, apiBaseUrl: a.apiBaseUrl, apiKey: a.apiKey, apiModel: a.apiModel,
-      ccBaseUrl: a.ccBaseUrl, ccAuthToken: a.ccAuthToken, ccModel: a.ccModel, ccOauthToken: a.ccOauthToken,
-      ocModel: a.ocModel, ocApiKey: a.ocApiKey, ocProvider: a.ocProvider,
-      codexModel: a.codexModel, codexApiKey: a.codexApiKey,
-      hermesProvider: a.hermesProvider, hermesModel: a.hermesModel, hermesApiKey: a.hermesApiKey,
+      engine: a.engine, apiBaseUrl: a.apiBaseUrl, apiModel: a.apiModel,
+      ccBaseUrl: a.ccBaseUrl, ccModel: a.ccModel,
+      ocModel: a.ocModel, ocProvider: a.ocProvider,
+      codexModel: a.codexModel,
+      hermesProvider: a.hermesProvider, hermesModel: a.hermesModel,
+      lastFailure: a.lastFailure || null,
       loop: a.loop, apiHistory: a.apiHistory || [],
       transcript: (a.transcript || []).slice(-300),   // cap history size on disk
       totalsHistory: (a.totals && a.totals.history) || [],
     })),
   };
   try {
-    // Keep a one-step backup before every write (accidental-delete safety net).
+    const temp = `${DATA_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(d, null, 2), { encoding: 'utf8', mode: 0o600 });
     if (fs.existsSync(DATA_FILE)) fs.copyFileSync(DATA_FILE, DATA_FILE + '.bak');
-    fs.writeFileSync(DATA_FILE, JSON.stringify(d, null, 2));
+    fs.renameSync(temp, DATA_FILE);
+    try { fs.chmodSync(DATA_FILE, 0o600); } catch {}
   } catch (e) { console.log('save error', e.message); }
 }
 function saveTemplates() {
-  try { fs.writeFileSync(TEMPLATES_FILE, JSON.stringify(templates, null, 2)); } catch (e) { console.log('tpl save error', e.message); }
+  try {
+    const temp = `${TEMPLATES_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(templates, null, 2), { encoding: 'utf8', mode: 0o600 });
+    fs.renameSync(temp, TEMPLATES_FILE);
+  } catch (e) { console.log('tpl save error', e.message); }
 }
 
 // ---------- Helpers ----------
@@ -145,11 +175,12 @@ function publicAgent(a) {
            cwd: a.cwd, busy: a.busy, hasSession: !!a.sessionId, totals: a.totals,
            accountId: a.accountId || '',
            engine: a.engine || 'claude-code',
-           apiBaseUrl: a.apiBaseUrl || '', apiKey: a.apiKey || '', apiModel: a.apiModel || '',
-           ccBaseUrl: a.ccBaseUrl || '', ccAuthToken: a.ccAuthToken || '', ccModel: a.ccModel || '', ccOauthToken: a.ccOauthToken || '',
-           ocModel: a.ocModel || '', ocApiKey: a.ocApiKey || '', ocProvider: a.ocProvider || '',
-           codexModel: a.codexModel || '', codexApiKey: a.codexApiKey || '',
-           hermesProvider: a.hermesProvider || '', hermesModel: a.hermesModel || '', hermesApiKey: a.hermesApiKey || '',
+           apiBaseUrl: a.apiBaseUrl || '', hasApiKey: !!a.apiKey, apiModel: a.apiModel || '',
+           ccBaseUrl: a.ccBaseUrl || '', hasClaudeToken: !!(a.ccAuthToken || a.ccOauthToken), ccModel: a.ccModel || '',
+           ocModel: a.ocModel || '', hasOpenClawKey: !!a.ocApiKey, ocProvider: a.ocProvider || '',
+           codexModel: a.codexModel || '', hasCodexKey: !!a.codexApiKey,
+           hermesProvider: a.hermesProvider || '', hermesModel: a.hermesModel || '', hasHermesKey: !!a.hermesApiKey,
+           lastFailure: a.lastFailure || null,
            loop: a.loop || newLoop() };
 }
 function publicState() {
@@ -157,7 +188,13 @@ function publicState() {
     activeProjectId: state.activeProjectId,
     projects: state.projects,
     templates,
-    accounts: state.accounts,
+    accounts: state.accounts.map((account) => ({ id: account.id, name: account.name, color: account.color, provider: account.provider })),
+    product: {
+      onboarded: !!state.meta.onboarded,
+      onboardingVersion: state.meta.onboardingVersion || 0,
+      entitlement: entitlementFor(state.meta),
+      desktop: process.env.MC_DESKTOP === '1',
+    },
     agents: [...agents.values()].map(publicAgent),
   };
 }
@@ -187,22 +224,119 @@ function buildPersona(agent, opts = {}) {
   return parts.filter(Boolean).join('\n\n');
 }
 
+function ensureMission(project) {
+  if (!project) return null;
+  if (!project.mission) {
+    project.mission = {
+      id: randomUUID(),
+      objective: '',
+      acceptance: project.deliverable ? [`Open and review ${project.deliverable}`] : [],
+      decisions: [],
+      artifacts: [],
+      providerTransitions: [],
+      journal: [],
+      activeLease: null,
+      status: 'ready',
+    };
+  }
+  return project.mission;
+}
+
+function missionJournal(agent, type, detail = {}) {
+  const mission = ensureMission(getProject(agent.projectId));
+  if (!mission) return;
+  mission.journal.push({ at: Date.now(), type, agentId: agent.id, provider: agent.engine === 'codex' ? 'codex' : 'claude', ...detail });
+  if (mission.journal.length > 300) mission.journal = mission.journal.slice(-300);
+}
+
+function beginMissionRun(agent, objective) {
+  const mission = ensureMission(getProject(agent.projectId));
+  if (!mission) return null;
+  if (!mission.objective) mission.objective = objective;
+  const lease = { id: randomUUID(), agentId: agent.id, provider: agent.engine === 'codex' ? 'codex' : 'claude', startedAt: Date.now() };
+  mission.activeLease = lease;
+  mission.status = 'running';
+  missionJournal(agent, 'run_started', { leaseId: lease.id });
+  return lease;
+}
+
+function finishMissionRun(agent, status) {
+  const mission = ensureMission(getProject(agent.projectId));
+  if (!mission) return;
+  const leaseId = mission.activeLease && mission.activeLease.agentId === agent.id ? mission.activeLease.id : null;
+  if (leaseId) mission.activeLease = null;
+  mission.status = status;
+  missionJournal(agent, 'run_finished', { leaseId, status });
+}
+
+function buildContinuationContext(agent) {
+  const project = getProject(agent.projectId);
+  const mission = ensureMission(project);
+  const recent = (agent.transcript || []).slice(-24).filter((message) => ['user', 'assistant', 'error', 'system'].includes(message.role));
+  const files = project && fs.existsSync(project.cwd)
+    ? fs.readdirSync(project.cwd, { withFileTypes: true }).filter((entry) => entry.isFile()).map((entry) => entry.name).slice(0, 80)
+    : [];
+  return [
+    '=== PROVIDER CONTINUATION CHECKPOINT ===',
+    `Mission: ${(mission && mission.objective) || 'Continue the approved project objective.'}`,
+    `Expected deliverable: ${(project && project.deliverable) || 'See the project instructions.'}`,
+    `Existing files: ${files.join(', ') || '(inspect the workspace)'}`,
+    'Recent project conversation:',
+    ...recent.map((message) => `${message.role.toUpperCase()}: ${String(message.text || '').slice(0, 1800)}`),
+    'Continue only unfinished work. Inspect existing files before editing. Do not repeat an external action whose result is uncertain.',
+  ].join('\n');
+}
+
+function composeTurnInput(agent, text, options = {}) {
+  const sections = [];
+  if (!agent.primedSoul) {
+    const persona = buildPersona(agent, options);
+    if (persona) sections.push(persona);
+    agent.primedSoul = true;
+  }
+  if (agent.pendingContext) sections.push(agent.pendingContext);
+  agent.pendingContext = null;
+  sections.push(`=== YOUR TASK ===\n${text}`);
+  return sections.join('\n\n');
+}
+
 // ---------- HTTP utils ----------
-function json(res, code, obj) { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); }
+const SECURITY_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'no-referrer',
+  'Cross-Origin-Resource-Policy': 'same-origin',
+  'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+};
+function json(res, code, obj, headers = {}) {
+  res.writeHead(code, { ...SECURITY_HEADERS, 'Content-Type': 'application/json; charset=utf-8', ...headers });
+  res.end(JSON.stringify(obj));
+}
 function serveStatic(res, file) {
   const full = path.join(__dirname, 'public', file);
   fs.readFile(full, (err, data) => {
     if (err) { res.writeHead(404); res.end('Not found'); return; }
     const types = { '.html': 'text/html', '.js': 'application/javascript', '.css': 'text/css' };
-    res.writeHead(200, { 'Content-Type': types[path.extname(file)] || 'text/plain' });
+    res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': types[path.extname(file)] || 'text/plain' });
     res.end(data);
   });
 }
 function readBody(req) {
   return new Promise((resolve) => {
     let data = '';
-    req.on('data', (c) => (data += c));
-    req.on('end', () => { try { resolve(data ? JSON.parse(data) : {}); } catch { resolve({}); } });
+    let tooLarge = false;
+    req.on('data', (c) => {
+      if (tooLarge) return;
+      data += c;
+      if (data.length > 5 * 1024 * 1024) {
+        tooLarge = true;
+        data = '';
+      }
+    });
+    req.on('end', () => {
+      if (tooLarge) return resolve({ __tooLarge: true });
+      try { resolve(data ? JSON.parse(data) : {}); } catch { resolve({}); }
+    });
   });
 }
 function send(res, obj) { res.write(JSON.stringify(obj) + '\n'); }
@@ -234,13 +368,12 @@ function createAgent(o) {
     model: o.model || '', reportsTo: o.reportsTo || '', projectId: o.projectId,
     cwd: o.cwd || (getProject(o.projectId) || {}).cwd || DEFAULT_CWD,
     accountId: o.accountId || '',
-    // Engine: 'claude-code' (full tools) or 'api' (direct OpenAI-compatible, chat only)
-    engine: o.engine || 'claude-code', effort: o.effort || '',
-    apiBaseUrl: o.apiBaseUrl || '', apiKey: o.apiKey || '', apiModel: o.apiModel || '',
-    ccBaseUrl: o.ccBaseUrl || '', ccAuthToken: o.ccAuthToken || '', ccModel: o.ccModel || '', ccOauthToken: o.ccOauthToken || '',
-    ocModel: o.ocModel || '', ocApiKey: o.ocApiKey || '', ocProvider: o.ocProvider || '',
-    codexModel: o.codexModel || '', codexApiKey: o.codexApiKey || '',
-    hermesProvider: o.hermesProvider || '', hermesModel: o.hermesModel || '', hermesApiKey: o.hermesApiKey || '',
+    engine: ALLOWED_ENGINES.has(o.engine) ? o.engine : 'claude-code', effort: o.effort || '',
+    apiBaseUrl: '', apiKey: '', apiModel: '',
+    ccBaseUrl: '', ccAuthToken: '', ccModel: o.ccModel || '', ccOauthToken: '',
+    ocModel: '', ocApiKey: '', ocProvider: '',
+    codexModel: o.codexModel || '', codexApiKey: '',
+    hermesProvider: '', hermesModel: '', hermesApiKey: '',
     loop: newLoop(),
     sessionId: null, busy: false, totals: newTotals(), primedSoul: false, pendingContext: null,
     apiHistory: [], transcript: [],
@@ -249,14 +382,55 @@ function createAgent(o) {
   return agent;
 }
 
+function createOutcomeProject({ name, cwd, outcomeId, provider }) {
+  const outcome = getOutcome(outcomeId);
+  if (!outcome) throw new Error('Choose a valid outcome');
+  const projectId = randomUUID().slice(0, 8);
+  const projectCwd = path.resolve((cwd && cwd.trim()) || path.join(DEFAULT_CWD, String(name || outcome.name).replace(/[^a-z0-9 _-]/gi, '').trim() || 'Foundry Project'));
+  fs.mkdirSync(projectCwd, { recursive: true });
+  const project = {
+    id: projectId,
+    name: (name || outcome.name).trim(),
+    cwd: projectCwd,
+    contextFiles: [],
+    size: 'S',
+    goal: outcomeId,
+    outcomeId,
+    deliverable: outcome.deliverable,
+    createdAt: Date.now(),
+    mission: {
+      id: randomUUID(),
+      objective: outcome.description,
+      acceptance: [`Open and review ${outcome.deliverable}`, 'All commercial claims are tied to supplied evidence', 'No external action occurred without approval'],
+      decisions: [{ at: Date.now(), text: `Primary provider: ${provider}` }],
+      artifacts: [],
+      providerTransitions: [],
+      journal: [],
+      activeLease: null,
+      status: 'ready',
+    },
+  };
+  state.projects.push(project);
+  state.activeProjectId = projectId;
+  const engine = provider === 'codex' ? 'codex' : 'claude-code';
+  outcome.workers.forEach((worker) => createAgent({
+    projectId,
+    name: worker.role,
+    role: worker.role,
+    soul: `${worker.soul}\n\nThe agreed project deliverable is ${outcome.deliverable}. Keep work inside the project folder and make progress visible in files. Ask for approval before irreversible or public actions.`,
+    reportsTo: worker.reportsTo || '',
+    engine,
+  }));
+  return project;
+}
+
 // ---------- Run a turn ----------
 // Abort a running turn (Claude Code child process or in-flight API request).
 function stopAgent(agent) {
   agent.stopped = true;
   if (agent.child) {
     const pid = agent.child.pid;
-    // shell:true spawns cmd -> claude.cmd -> node. Kill the WHOLE tree by pid
-    // while it's still intact (do NOT child.kill() first — that orphans node).
+    // On Windows, terminate the provider process tree so helper processes do not linger.
     if (pid && process.platform === 'win32') {
       try { spawn('taskkill', ['/pid', String(pid), '/T', '/F']); } catch {}
     } else {
@@ -301,16 +475,8 @@ function runTurn(agent, text, res) {
   const model = agent.ccModel || agent.model;
 
   const launch = (isRetry) => {
-    // Persona priming happens through stdin (no shell-quoting headaches).
-    let toSend = text;
-    if (!agent.primedSoul) {
-      const persona = buildPersona(agent);
-      if (persona) toSend = persona + '\n\n=== YOUR TASK ===\n' + text;
-      agent.primedSoul = true;
-    } else if (agent.pendingContext) {
-      toSend = agent.pendingContext + '\n\n' + text;
-    }
-    agent.pendingContext = null;
+    const toSend = composeTurnInput(agent, text);
+    let providerSignal = null;
 
     const args = ['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', PERMISSION_MODE];
     if (model) args.push('--model', model);
@@ -319,7 +485,7 @@ function runTurn(agent, text, res) {
     if (resuming) args.push('--resume', agent.sessionId);
 
     let child;
-    try { child = spawn('claude', args, { cwd: agent.cwd, shell: true, env }); }
+    try { child = spawn(providerCommand('claude'), args, { cwd: agent.cwd, shell: false, windowsHide: true, env }); }
     catch (e) { send(res, { type: 'error', error: String(e) }); agent.busy = false; return res.end(); }
 
     agent.child = child;
@@ -336,6 +502,7 @@ function runTurn(agent, text, res) {
         buf = buf.slice(idx + 1);
         if (!line) continue;
         let evt; try { evt = JSON.parse(line); } catch { continue; }
+        providerSignal = findProviderFailure(evt) || providerSignal;
         handleEvent(agent, evt, res);
       }
     });
@@ -344,11 +511,17 @@ function runTurn(agent, text, res) {
     child.stderr.on('data', (c) => (stderr += c.toString()));
 
     child.on('close', (code) => {
-      if (buf.trim()) { try { handleEvent(agent, JSON.parse(buf.trim()), res); } catch {} }
+      if (buf.trim()) {
+        try {
+          const evt = JSON.parse(buf.trim());
+          providerSignal = findProviderFailure(evt) || providerSignal;
+          handleEvent(agent, evt, res);
+        } catch {}
+      }
       agent.child = null;
       if (agent.stopped) { send(res, { type: 'system', stopped: true }); pushMsg(agent, { role: 'stopped' }); agent.stopped = false; }
       else if (code) {
-        const errText = stderr.trim() || `claude exited with code ${code}`;
+        const errText = (providerSignal && providerSignal.message) || stderr.trim() || `claude exited with code ${code}`;
         // A resume against a session that doesn't exist in THIS account's profile
         // (e.g. the worker's account was just switched) — drop it and start fresh once.
         if (resuming && !isRetry && /no conversation found|session id|session not found/i.test(errText)) {
@@ -356,10 +529,12 @@ function runTurn(agent, text, res) {
           agent.primedSoul = false;
           return launch(true);
         }
+        agent.lastFailure = { kind: (providerSignal && providerSignal.kind) || classifyProviderFailure(errText), message: errText.slice(0, 600), provider: 'claude', at: Date.now() };
         send(res, { type: 'error', error: errText });
         pushMsg(agent, { role: 'error', text: errText });
-      }
+      } else agent.lastFailure = null;
       agent.busy = false;
+      finishMissionRun(agent, code ? 'blocked' : 'needs_review');
       saveData();
       send(res, { type: 'done' });
       res.end();
@@ -368,6 +543,8 @@ function runTurn(agent, text, res) {
     child.on('error', (err) => {
       send(res, { type: 'error', error: 'Failed to start claude: ' + err.message });
       agent.busy = false;
+      finishMissionRun(agent, 'blocked');
+      saveData();
       res.end();
     });
   };
@@ -568,28 +745,26 @@ async function runCodexTurn(agent, text, res) {
   agent.busy = true;
   res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Cache-Control': 'no-cache' });
 
-  let toSend = text;
-  if (!agent.primedSoul) {
-    const persona = buildPersona(agent, { withContents: true });
-    if (persona) toSend = persona + '\n\n=== YOUR TASK ===\n' + text;
-    agent.primedSoul = true;
-  }
+  const toSend = composeTurnInput(agent, text, { withContents: true });
 
   const env = { ...process.env };
   const apiKey = (agent.codexApiKey || '').trim();
   if (apiKey) env.OPENAI_API_KEY = apiKey;
 
-  const model = (agent.codexModel || '').trim();
-  const args = ['exec', '--json', '--skip-git-repo-check'];
+  const requestedModel = (agent.codexModel || '').trim();
+  const model = /^[a-zA-Z0-9._:/-]{1,120}$/.test(requestedModel) ? requestedModel : '';
+  const args = ['exec', '--json', '--skip-git-repo-check', '--sandbox', 'workspace-write'];
   if (model) args.push('-m', model);
-  args.push(toSend);
+  args.push('-');
 
   let child;
-  try { child = spawn('codex', args, { cwd: agent.cwd, shell: true, env }); }
+  try { child = spawn(providerCommand('codex'), args, { cwd: agent.cwd, shell: false, windowsHide: true, env }); }
   catch (e) { send(res, { type: 'error', error: 'Failed to start codex: ' + String(e) }); agent.busy = false; send(res, { type: 'done' }); return res.end(); }
 
   agent.child = child;
   agent.stopped = false;
+  child.stdin.write(toSend);
+  child.stdin.end();
 
   // Pull any human-readable text out of a Codex JSONL event, whatever its shape.
   const extractText = (evt) => {
@@ -635,12 +810,18 @@ async function runCodexTurn(agent, text, res) {
     }
     agent.child = null;
     if (agent.stopped) { send(res, { type: 'system', stopped: true }); agent.stopped = false; }
-    else if (code && code !== 0) send(res, { type: 'error', error: stderr.trim() || `codex exited with code ${code}` });
+    else if (code && code !== 0) {
+      const errText = stderr.trim() || `codex exited with code ${code}`;
+      agent.lastFailure = { kind: classifyProviderFailure(errText), message: errText.slice(0, 600), provider: 'codex', at: Date.now() };
+      pushMsg(agent, { role: 'error', text: errText });
+      send(res, { type: 'error', error: errText });
+    }
     agent.totals.turns += 1;
     if (!agent.totals.history) agent.totals.history = [];
     agent.totals.history.push({ ts: Date.now(), input: 0, output: 0, cache: 0, cost: 0, engine: 'codex' });
     agent.busy = false;
     agent.sessionId = agent.sessionId || ('codex-' + agent.id);
+    finishMissionRun(agent, code ? 'blocked' : 'needs_review');
     saveData();
     send(res, { type: 'done' });
     res.end();
@@ -649,6 +830,8 @@ async function runCodexTurn(agent, text, res) {
   child.on('error', (err) => {
     send(res, { type: 'error', error: 'Failed to start codex: ' + err.message });
     agent.busy = false;
+    finishMissionRun(agent, 'blocked');
+    saveData();
     send(res, { type: 'done' });
     res.end();
   });
@@ -761,14 +944,116 @@ async function runHermesTurn(agent, text, res) {
 
 // ---------- Router ----------
 const server = http.createServer(async (req, res) => {
-  const { pathname } = new URL(req.url, 'http://localhost');
+  const requestUrl = new URL(req.url, 'http://localhost');
+  const { pathname } = requestUrl;
   const method = req.method;
+
+  if (pathname === '/api/health') {
+    const allowed = !LOCAL_TOKEN || req.headers['x-foundry-token'] === LOCAL_TOKEN || String(req.headers.cookie || '').includes(`foundry_session=${LOCAL_TOKEN}`);
+    return allowed ? json(res, 200, { ok: true, version: '0.9.0' }) : json(res, 401, { error: 'unauthorized' });
+  }
+
+  if (LOCAL_TOKEN && pathname === '/' && requestUrl.searchParams.get('token') === LOCAL_TOKEN) {
+    res.writeHead(302, {
+      ...SECURITY_HEADERS,
+      'Set-Cookie': `foundry_session=${LOCAL_TOKEN}; HttpOnly; SameSite=Strict; Path=/`,
+      Location: '/',
+    });
+    return res.end();
+  }
+  if (LOCAL_TOKEN && !String(req.headers.cookie || '').includes(`foundry_session=${LOCAL_TOKEN}`)) {
+    return json(res, 401, { error: 'unauthorized' });
+  }
 
   if (pathname === '/') return serveStatic(res, 'index.html');
   if (pathname === '/app.js') return serveStatic(res, 'app.js');
-  if (pathname === '/reel-ui.js') return serveStatic(res, 'reel-ui.js');
+  if (pathname === '/onboarding.css') return serveStatic(res, 'onboarding.css');
+  if (pathname === '/onboarding.js') return serveStatic(res, 'onboarding.js');
 
   if (pathname === '/api/state' && method === 'GET') return json(res, 200, publicState());
+
+  if (pathname === '/api/system/status' && method === 'GET') {
+    try {
+      const providers = await allProviderStatuses();
+      return json(res, 200, {
+        version: '0.9.0',
+        desktop: process.env.MC_DESKTOP === '1',
+        permissionMode: PERMISSION_MODE,
+        dataDir: DATA_DIR,
+        providers,
+      });
+    } catch (error) {
+      return json(res, 500, { error: error.message });
+    }
+  }
+
+  const providerLogin = pathname.match(/^\/api\/providers\/(claude|codex)\/login$/);
+  if (providerLogin && method === 'POST') {
+    try { return json(res, 200, launchProviderLogin(providerLogin[1])); }
+    catch (error) { return json(res, 500, { ok: false, error: error.message }); }
+  }
+
+  if (pathname === '/api/onboarding' && method === 'GET') {
+    return json(res, 200, {
+      onboarded: !!state.meta.onboarded,
+      outcomes: publicOutcomes(),
+      entitlement: entitlementFor(state.meta),
+    });
+  }
+
+  if (pathname === '/api/onboarding/complete' && method === 'POST') {
+    const body = await readBody(req);
+    if (!['claude', 'codex'].includes(body.provider)) return json(res, 400, { error: 'Choose Claude or Codex' });
+    let providers;
+    try { providers = await allProviderStatuses(); }
+    catch (error) { return json(res, 500, { error: error.message }); }
+    if (!providers[body.provider] || !providers[body.provider].connected) {
+      return json(res, 409, { error: `Connect ${body.provider === 'claude' ? 'Claude' : 'Codex'} before creating the team.`, code: 'provider_not_connected' });
+    }
+    try {
+      startTrial(state.meta);
+      const project = createOutcomeProject({
+        name: body.projectName,
+        cwd: body.cwd,
+        outcomeId: body.outcomeId,
+        provider: body.provider,
+      });
+      state.meta.onboarded = true;
+      state.meta.onboardingVersion = 1;
+      state.meta.primaryProvider = body.provider;
+      state.meta.primaryOutcome = body.outcomeId;
+      state.meta.activatedAt = null;
+      saveData();
+      return json(res, 200, { ok: true, project, state: publicState() });
+    } catch (error) {
+      return json(res, 400, { error: error.message });
+    }
+  }
+
+  if (pathname === '/api/missions/import' && method === 'POST') {
+    const access = canCreateProject(state.meta, state.projects.length);
+    if (!access.allowed) return json(res, 402, { error: `Your ${access.entitlement.name} plan includes ${access.entitlement.projectLimit} active project.`, code: 'project_limit' });
+    const body = await readBody(req);
+    const mission = body.mission || {};
+    if (mission.schema !== 'foundry.mission.v1') return json(res, 400, { error: 'Unsupported mission file.' });
+    const name = String(mission.project && mission.project.name || '').trim().slice(0, 120);
+    const outcomeId = String(mission.project && mission.project.outcomeId || 'campaign_review');
+    const objective = String(mission.objective || '').trim().slice(0, 12000);
+    if (!name || !objective || !getOutcome(outcomeId)) return json(res, 400, { error: 'Mission needs a valid project name, outcome, and objective.' });
+    const provider = ['claude', 'codex'].includes(body.provider) ? body.provider : (state.meta.primaryProvider || 'codex');
+    try {
+      const project = createOutcomeProject({ name, cwd: body.cwd, outcomeId, provider });
+      project.mission.objective = objective;
+      project.mission.deadline = mission.deadline || null;
+      project.mission.importedAt = Date.now();
+      const notes = [mission.evidenceNotes && `Evidence notes:\n${String(mission.evidenceNotes).slice(0, 12000)}`, mission.constraints && `Constraints:\n${String(mission.constraints).slice(0, 12000)}`].filter(Boolean).join('\n\n');
+      if (notes) projectAgents(project.id).forEach((agent) => { agent.pendingContext = `=== IMPORTED MISSION ===\n${objective}\n\n${notes}`; });
+      saveData();
+      return json(res, 200, { ok: true, project, state: publicState() });
+    } catch (error) {
+      return json(res, 400, { error: error.message });
+    }
+  }
 
   if (pathname === '/api/browse' && method === 'GET') {
     // List subdirectories of a path. If no path given, list common roots.
@@ -815,6 +1100,10 @@ const server = http.createServer(async (req, res) => {
     }
     all.sort((a, b) => a.ts - b.ts);
     return json(res, 200, { usage: all });
+  }
+
+  if (['/api/account/logout', '/api/account/backups', '/api/account/restore'].includes(pathname)) {
+    return json(res, 410, { ok: false, error: 'Legacy credential backup routes are disabled in Foundry Desktop.' });
   }
 
   if (pathname === '/api/account' && method === 'GET') {
@@ -879,24 +1168,7 @@ const server = http.createServer(async (req, res) => {
   // used per-agent via CLAUDE_CODE_OAUTH_TOKEN. The request blocks (up to 3 min) while
   // the user completes the browser step.
   if (pathname === '/api/account/setup-token' && method === 'POST') {
-    try {
-      const child = spawn('claude', ['setup-token'], { shell: true });
-      let out = '';
-      const grab = (d) => { out += d.toString(); };
-      child.stdout.on('data', grab);
-      child.stderr.on('data', grab);
-      let done = false;
-      const finish = (extra) => {
-        if (done) return; done = true;
-        const token = (out.match(/sk-ant-oat[A-Za-z0-9_-]+/) || [])[0] || '';
-        const url = (out.match(/https?:\/\/[^\s'"]+/) || [])[0] || '';
-        json(res, 200, { ok: !!token, token, url, output: out.slice(-2000), ...(extra || {}) });
-      };
-      const timer = setTimeout(() => { try { child.kill(); } catch {} finish({ timedOut: true }); }, 180000);
-      child.on('close', () => { clearTimeout(timer); finish(); });
-      child.on('error', (e) => { clearTimeout(timer); finish({ error: e.message }); });
-    } catch (e) { json(res, 500, { ok: false, error: e.message }); }
-    return;
+    return json(res, 410, { ok: false, error: 'Token capture is disabled. Connect through the official Claude sign-in flow.' });
   }
 
   // ---- Account Vault: named, reusable Claude accounts (one token, many workers) ----
@@ -909,16 +1181,15 @@ const server = http.createServer(async (req, res) => {
       acct.name = name;
       if (b.color != null) acct.color = b.color;
       if (b.provider != null) acct.provider = b.provider;
-      if (b.token != null && b.token !== '') acct.token = b.token; // keep old token if blank on edit
     } else {
       const id = randomUUID().slice(0, 8);
       const configDir = path.join(ACCOUNTS_BASE, id);
       try { fs.mkdirSync(configDir, { recursive: true }); } catch {}
-      acct = { id, name, color: b.color || '#E8A33D', provider: b.provider || 'claude', token: b.token || '', configDir };
+      acct = { id, name, color: b.color || '#E8A33D', provider: b.provider || 'claude', configDir };
       state.accounts.push(acct);
     }
     saveData();
-    return json(res, 200, acct);
+    return json(res, 200, { id: acct.id, name: acct.name, color: acct.color, provider: acct.provider });
   }
 
   // Open a terminal that logs this account into its OWN config dir (isolated login,
@@ -1011,6 +1282,8 @@ const server = http.createServer(async (req, res) => {
 
   // ----- Projects -----
   if (pathname === '/api/projects' && method === 'POST') {
+    const projectAccess = canCreateProject(state.meta, state.projects.length);
+    if (!projectAccess.allowed) return json(res, 402, { error: `Your ${projectAccess.entitlement.name} plan includes ${projectAccess.entitlement.projectLimit} active project.`, code: 'project_limit', entitlement: projectAccess.entitlement });
     const b = await readBody(req);
     const id = randomUUID().slice(0, 8);
     const proj = { id, name: b.name || 'Untitled Project', cwd: (b.cwd && b.cwd.trim()) || DEFAULT_CWD, contextFiles: [], size: b.size || '', goal: b.goal || '' };
@@ -1039,7 +1312,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   let m;
-  if ((m = pathname.match(/^\/api\/projects\/([^/]+)(\/activate|\/files)?$/))) {
+  if ((m = pathname.match(/^\/api\/projects\/([^/]+)(\/activate|\/files|\/accept|\/mission)?$/))) {
     const proj = getProject(m[1]);
     if (method === 'DELETE') {
       projectAgents(m[1]).forEach((a) => agents.delete(a.id));
@@ -1050,6 +1323,18 @@ const server = http.createServer(async (req, res) => {
     }
     if (!proj) return json(res, 404, { error: 'no such project' });
     if (m[2] === '/activate' && method === 'POST') { state.activeProjectId = proj.id; saveData(); return json(res, 200, publicState()); }
+    if (m[2] === '/mission' && method === 'GET') return json(res, 200, { projectId: proj.id, mission: ensureMission(proj), deliverable: proj.deliverable || null });
+    if (m[2] === '/accept' && method === 'POST') {
+      const mission = ensureMission(proj);
+      const deliverablePath = proj.deliverable ? path.join(proj.cwd, proj.deliverable) : null;
+      if (!deliverablePath || !fs.existsSync(deliverablePath)) return json(res, 409, { error: 'The agreed deliverable does not exist yet.', code: 'deliverable_missing' });
+      mission.status = 'accepted';
+      mission.acceptedAt = Date.now();
+      mission.artifacts = Array.from(new Set([...(mission.artifacts || []), deliverablePath]));
+      state.meta.activatedAt = state.meta.activatedAt || Date.now();
+      saveData();
+      return json(res, 200, { ok: true, mission, deliverablePath });
+    }
     if (m[2] === '/files' && method === 'POST') {
       const b = await readBody(req);
       if (b.removePath) {
@@ -1069,11 +1354,18 @@ const server = http.createServer(async (req, res) => {
   if (pathname === '/api/agents' && method === 'POST') {
     const b = await readBody(req);
     if (!getProject(b.projectId)) return json(res, 400, { error: 'projectId required' });
+    if (b.__tooLarge) return json(res, 413, { error: 'Request is too large.' });
+    if (b.engine && !ALLOWED_ENGINES.has(b.engine)) return json(res, 400, { error: 'Only Claude Code and Codex workers are available in this build.', code: 'engine_not_allowed' });
+    if (['apiKey', 'ccAuthToken', 'ccOauthToken', 'ocApiKey', 'codexApiKey', 'hermesApiKey'].some((field) => b[field])) {
+      return json(res, 400, { error: 'Foundry uses the official provider sign-in. Raw access tokens are not accepted.', code: 'raw_token_rejected' });
+    }
+    const workerAccess = canCreateWorker(state.meta, projectAgents(b.projectId).length);
+    if (!workerAccess.allowed) return json(res, 402, { error: `Your ${workerAccess.entitlement.name} plan includes ${workerAccess.entitlement.workerLimit} workers per project.`, code: 'worker_limit', entitlement: workerAccess.entitlement });
     createAgent(b);
     saveData();
     return json(res, 200, publicState());
   }
-  if ((m = pathname.match(/^\/api\/agents\/([^/]+)(\/message|\/model|\/upload|\/edit|\/stop|\/save|\/loop|\/transcript)?$/))) {
+  if ((m = pathname.match(/^\/api\/agents\/([^/]+)(\/message|\/model|\/upload|\/edit|\/stop|\/save|\/loop|\/transcript|\/failover)?$/))) {
     const agent = agents.get(m[1]);
     if (method === 'DELETE') { agents.delete(m[1]); saveData(); return json(res, 200, publicState()); }
     if (!agent) return json(res, 404, { error: 'no such agent' });
@@ -1101,6 +1393,28 @@ const server = http.createServer(async (req, res) => {
     if (m[2] === '/stop' && method === 'POST') {
       if (agent.loop && agent.loop.active) { agent.loop.active = false; agent.loop.reason = 'stopped by you'; }
       stopAgent(agent); return json(res, 200, { ok: true });
+    }
+    if (m[2] === '/failover' && method === 'POST') {
+      const previous = agent.engine || 'claude-code';
+      const next = alternateEngine(previous);
+      const nextProvider = next === 'codex' ? 'codex' : 'claude';
+      const providerStates = await allProviderStatuses();
+      if (!providerStates[nextProvider] || !providerStates[nextProvider].connected) {
+        return json(res, 409, { error: `Connect ${nextProvider === 'codex' ? 'Codex' : 'Claude'} before switching.`, code: 'alternate_not_connected', provider: nextProvider });
+      }
+      agent.engine = next;
+      agent.sessionId = null;
+      agent.primedSoul = false;
+      agent.lastFailure = null;
+      agent.pendingContext = buildContinuationContext(agent);
+      const mission = ensureMission(getProject(agent.projectId));
+      if (mission) {
+        mission.providerTransitions.push({ at: Date.now(), from: previous === 'codex' ? 'codex' : 'claude', to: nextProvider, reason: 'user_requested_recovery' });
+        mission.status = 'ready';
+      }
+      pushMsg(agent, { role: 'system', text: `Provider switched from ${previous === 'codex' ? 'Codex' : 'Claude'} to ${next === 'codex' ? 'Codex' : 'Claude'}. The project files and transcript were preserved.` });
+      saveData();
+      return json(res, 200, { ok: true, previous, engine: next, agent: publicAgent(agent) });
     }
     if (m[2] === '/loop' && method === 'POST') {
       const b = await readBody(req);
@@ -1133,7 +1447,10 @@ const server = http.createServer(async (req, res) => {
       const b = await readBody(req);
       const text = (b.text || '').trim();
       if (!text) return json(res, 400, { error: 'empty message' });
+      if (agent.busy) return json(res, 409, { error: 'This worker is already running.', code: 'worker_busy' });
       pushMsg(agent, { role: 'user', text });   // record in persisted transcript
+      beginMissionRun(agent, text);
+      saveData();
       return runTurn(agent, text, res);
     }
     if (m[2] === '/model' && method === 'POST') { const b = await readBody(req); agent.model = b.model || ''; saveData(); return json(res, 200, publicAgent(agent)); }
@@ -1149,22 +1466,15 @@ const server = http.createServer(async (req, res) => {
       }
       if (b.soul != null && b.soul !== agent.soul) { agent.soul = b.soul; agent.primedSoul = false; }
       if (b.effort != null) agent.effort = b.effort;
-      if (b.engine != null) agent.engine = b.engine;
-      if (b.apiBaseUrl != null) agent.apiBaseUrl = b.apiBaseUrl;
-      if (b.apiKey != null) agent.apiKey = b.apiKey;
-      if (b.apiModel != null) agent.apiModel = b.apiModel;
-      if (b.ccBaseUrl != null) agent.ccBaseUrl = b.ccBaseUrl;
-      if (b.ccAuthToken != null) agent.ccAuthToken = b.ccAuthToken;
-      if (b.ccModel != null) agent.ccModel = b.ccModel;
-      if (b.ccOauthToken != null) agent.ccOauthToken = b.ccOauthToken;
-      if (b.ocProvider != null) agent.ocProvider = b.ocProvider;
-      if (b.ocModel != null) agent.ocModel = b.ocModel;
-      if (b.ocApiKey != null) agent.ocApiKey = b.ocApiKey;
-      if (b.codexModel != null) agent.codexModel = b.codexModel;
-      if (b.codexApiKey != null) agent.codexApiKey = b.codexApiKey;
-      if (b.hermesProvider != null) agent.hermesProvider = b.hermesProvider;
-      if (b.hermesModel != null) agent.hermesModel = b.hermesModel;
-      if (b.hermesApiKey != null) agent.hermesApiKey = b.hermesApiKey;
+      if (b.engine != null) {
+        if (!ALLOWED_ENGINES.has(b.engine)) return json(res, 400, { error: 'Only Claude Code and Codex workers are available in this build.', code: 'engine_not_allowed' });
+        agent.engine = b.engine;
+      }
+      if (['apiKey', 'ccAuthToken', 'ccOauthToken', 'ocApiKey', 'codexApiKey', 'hermesApiKey'].some((field) => b[field])) {
+        return json(res, 400, { error: 'Foundry uses the official provider sign-in. Raw access tokens are not accepted.', code: 'raw_token_rejected' });
+      }
+      if (b.ccModel != null && /^[a-zA-Z0-9._:/-]{0,120}$/.test(b.ccModel)) agent.ccModel = b.ccModel;
+      if (b.codexModel != null && /^[a-zA-Z0-9._:/-]{0,120}$/.test(b.codexModel)) agent.codexModel = b.codexModel;
       saveData();
       return json(res, 200, publicAgent(agent));
     }
@@ -1218,12 +1528,6 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { templates });
   }
 
-  // The Reel — mini-app routes (/api/reel/*)
-  if (pathname.startsWith('/api/reel/')) {
-    const handled = await reel.route(pathname, method, req, res, { json, readBody });
-    if (handled !== false) return;
-  }
-
   res.writeHead(404);
   res.end('Not found');
 });
@@ -1238,12 +1542,15 @@ server.on('error', (err) => {
 });
 
 loadAll();
-server.listen(PORT, () => {
-  console.log(`\n  Mission Control v2  ->  http://localhost:${PORT}`);
+server.listen(PORT, HOST, () => {
+  const address = server.address();
+  const actualPort = typeof address === 'object' && address ? address.port : PORT;
+  console.log(`\n  Foundry  ->  http://${HOST}:${actualPort}`);
   console.log(`  Default project dir: ${DEFAULT_CWD}`);
   console.log(`  Permission mode: ${PERMISSION_MODE}`);
   console.log(`  Projects: ${state.projects.length} · Templates: ${templates.length}`);
   console.log(`\n  Open the URL above in your browser. Ctrl+C to stop.\n`);
+  if (process.send) process.send({ type: 'ready', port: actualPort });
 });
 
 // ---------- Built-in templates ----------
