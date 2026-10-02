@@ -1,0 +1,692 @@
+--- a/server.js
++++ b/server.js
+@@ -2068,6 +2068,11 @@
+ // A short, honest label of what a busy agent is doing right now (no fake %).
+ function agentActivity(agent) {
+   if (!agent.busy && !(agent.loop && agent.loop.active)) return '';
++  const pending = agent.pendingRuntimeEdits || [];
++  if (pending.length) {
++    const edit = pending[pending.length - 1].edit;
++    return (agent.waitingForSlot ? 'Waiting for a Claude slot' : 'Current turn running') + '; next turn: ' + (edit.codexModel || edit.model || edit.engine || 'updated configuration');
++  }
+   if (agent.waitingForSlot) return 'Waiting for an available Claude slot...';
+   if (agent._recoveringStall) return 'Recovering a stalled turn...';
+   const now = Date.now();
+@@ -2594,7 +2599,8 @@
+            isMaster: !!a.isMaster, scope: a.scope || '',
+            learnedPlaybookId: a.learnedPlaybookId || '', useAllSkills: !!a.useAllSkills, workflowMode: normalizeWorkflow(a.workflowMode),
+            cwd: a.cwd, busy: a.busy, turnStartedAt: a.busy ? (Number(a.turnStartedAt) || 0) : 0, hardStopped: !!a.hardStopped, hasSession: !!visibleSession, sessionId: visibleSession || '', totals: a.totals,
+-           queue: a.queue || [], connections: a.connections || [], collaborators: a.collaborators || [],
++           pendingRuntimeEdits: a.pendingRuntimeEdits || [], resumeRetryAt: a.resumeRetryAt || 0,
++      queue: a.queue || [], connections: a.connections || [], collaborators: a.collaborators || [],
+            harnessLastError: redactControlText(a.harnessLastError || '', 1000),
+            harnessExecutable: a.harnessExecutable || '',
+            harnessPromptChars: Number(a.harnessPromptChars) || 0,
+@@ -3205,7 +3211,7 @@
+ // ---------- Run a turn ----------
+ // Abort a running turn (Claude Code child process or in-flight API request).
+ function childIsAlive(child) {
+-  if (!child || !child.pid || child.exitCode != null || child.killed) return false;
++  if (!child || !child.pid || child.exitCode != null || child.signalCode != null) return false;
+   try { process.kill(child.pid, 0); return true; } catch { return false; }
+ }
+ function killProcessTree(pid) {
+@@ -3230,7 +3236,159 @@
+     for (const p of tree) { try { process.kill(p, 'SIGKILL'); } catch {} }
+   }
+ }
++// Turn ownership is independent of the UI busy flag and selected next engine.
++const agentTurns = new WeakMap();
++function agentHasTurn(agent) {
++  return !!(agentTurns.get(agent) || agent.child || childIsAlive({ pid: agent.activePid }));
++}
++function ownsTurn(agent, turn) { return agentTurns.get(agent) === turn; }
++function queueRuntimeEdit(agent, body, modelChoice = false) {
++  if (!agent.busy && !agentHasTurn(agent)) return false;
++  const fields = ['engine', 'model', 'codexModel', 'ccModel', 'effort', 'codexReasoningEffort', 'accountId'];
++  const edit = {};
++  for (const field of fields) if (body[field] != null) { edit[field] = body[field]; delete body[field]; }
++  if (!Object.keys(edit).length) return false;
++  agent.pendingRuntimeEdits = agent.pendingRuntimeEdits || [];
++  agent.pendingRuntimeEdits.push({ edit, modelChoice });
++  pushMsg(agent, { role: 'system', text: 'Engine/model change saved for the next turn. The current turn keeps its original provider.' });
++  return true;
++}
++function applyAgentEdit(agent, b) {
++      modelCouncil.normalizeAgentBody(agent, b, modelRoutingDeps());   // an OpenAI id in `model` = run on Codex
++      const oldNames = new Set([agent.name, agent.role].filter(Boolean));
++      if (b.name != null) agent.name = b.name;
++      if (b.role != null) agent.role = b.role;
++      // A rename keeps the team intact: teammates who reported to the old name report to the new
++      // one — unless another agent in the project still answers to the old name.
++      const newName = agent.role || agent.name;
++      if ((b.name != null || b.role != null) && newName && !oldNames.has(newName)) {
++        const mates = [...agents.values()].filter((o) => o !== agent && o.projectId === agent.projectId);
++        for (const old of oldNames) {
++          if (mates.some((o) => o.name === old || o.role === old)) continue;
++          for (const o of mates) if (o.reportsTo === old) o.reportsTo = newName;
++        }
++      }
++      if (b.reportsTo != null) agent.reportsTo = b.reportsTo;
++      if (b.connections != null) agent.connections = b.connections;
++      if (b.order != null) agent.order = b.order;
++      if (b.handoffTo != null) agent.handoffTo = b.handoffTo;
++      if (b.playbooks != null) { agent.playbooks = b.playbooks; agent.primedSoul = false; }
++      if (b.useAllSkills != null) { agent.useAllSkills = !!b.useAllSkills; agent.primedSoul = false; }
++      if (b.workflowMode != null) { agent.workflowMode = normalizeWorkflow(b.workflowMode); }
++      if (b.collaborators != null) { agent.collaborators = b.collaborators; agent.primedSoul = false; }
++      const codexModelChanging = b.codexModel != null && b.codexModel !== agent.codexModel;
++      const accountChanging = b.accountId != null && b.accountId !== agent.accountId;
++      const engineChanging = b.engine != null && b.engine !== agent.engine;
++      if (accountChanging || engineChanging) {
++        queueHistoryBridge(agent, (engineChanging ? (agent.engine + ' to ' + b.engine) : 'account change') + ' handoff');
++        agent.primedSoul = false;
++      }
++      if (!accountChanging && !engineChanging && (agent.engine === 'codex' || b.engine === 'codex') && codexModelChanging) {
++        queueHistoryBridge(agent, 'Codex model change from ' + (agent.codexModel || 'default') + ' to ' + (b.codexModel || 'default'));
++        agent.primedSoul = false;
++      }
++      if (accountChanging) {
++        // Switching account = different login/profile, each with its OWN sessions.
++        // Stash the CURRENT account's session so returning to it later resumes the same
++        // chat, then restore the target account's last session if we have one. This is
++        // what stops the "switched accounts and it forgot everything" data loss.
++        const nextEngine = b.engine || agent.engine || 'claude-code';
++        if (nextEngine === 'claude-code') {
++          if (!agent.sessionsByAccount) agent.sessionsByAccount = {};
++          if (agent.sessionId) agent.sessionsByAccount[acctKey(agent)] = agent.sessionId;   // outgoing
++          agent.accountId = b.accountId;
++          agent.sessionId = agent.sessionsByAccount[acctKey(agent)] || null;                 // incoming
++          agent.primedSoul = !!agent.sessionId;
++        } else {
++          agent.accountId = b.accountId;
++          agent.primedSoul = false;  // the selected engine restores its own account session
++        }
++      }
++      if (b.soul != null && b.soul !== agent.soul) { agent.soul = b.soul; agent.primedSoul = false; }
++      if (b.approach != null && b.approach !== agent.approach) { agent.approach = b.approach; agent.primedSoul = false; }
++      if (b.values != null && b.values !== agent.values) { agent.values = b.values; agent.primedSoul = false; }
++      if (b.effort != null) agent.effort = b.effort;
++      // Working directory: settable after creation. It used to be fixed at create time from the
++      // project's cwd, so an agent pointed at the wrong folder could never be moved without being
++      // rebuilt. Only an existing directory is accepted - a typo here would strand every turn.
++      if (b.cwd != null) {
++        const next = String(b.cwd || '').trim();
++        if (next && next !== agent.cwd) {
++          let ok = false;
++          try { ok = fs.existsSync(next) && fs.statSync(next).isDirectory(); } catch {}
++          if (ok) { agent.cwd = next; agent.primedSoul = false; }
++        }
++      }
++      // The worker editor saves the whole form in one POST, model included. Without this the
++      // model select silently did nothing on an existing agent (only /model applied it), so an
++      // agent could keep a model string belonging to a different engine after an engine switch.
++      if (b.model != null && b.model !== agent.model) {
++        agent.model = b.model;
++        pushMsg(agent, { role: 'system', text: '🔧 Model switched to ' + (agent.model || 'account default') + '. Takes effect on your next message — the run will report the exact model it loads.' });
++      }
++      if (engineChanging) { agent.engine = b.engine; agent.primedSoul = false; }
++      if (b.apiBaseUrl != null) agent.apiBaseUrl = b.apiBaseUrl;
++      if (b.apiKey != null) agent.apiKey = b.apiKey;
++      if (b.apiModel != null) agent.apiModel = b.apiModel;
++      if (b.ccBaseUrl != null) agent.ccBaseUrl = b.ccBaseUrl;
++      if (b.ccAuthToken != null) agent.ccAuthToken = b.ccAuthToken;
++      if (b.ccModel != null) agent.ccModel = b.ccModel;
++      if (b.ccOauthToken != null) agent.ccOauthToken = b.ccOauthToken;
++      if (b.ocProvider != null) agent.ocProvider = b.ocProvider;
++      if (b.ocModel != null) agent.ocModel = b.ocModel;
++      if (b.ocApiKey != null) agent.ocApiKey = b.ocApiKey;
++      if (b.codexModel != null) agent.codexModel = b.codexModel;
++      if (b.codexReasoningEffort != null) agent.codexReasoningEffort = b.codexReasoningEffort;
++      if (b.codexApiKey != null) agent.codexApiKey = b.codexApiKey;
++      if (b.hermesProvider != null) agent.hermesProvider = b.hermesProvider;
++      if (b.hermesModel != null) agent.hermesModel = b.hermesModel;
++      if (b.hermesApiKey != null) agent.hermesApiKey = b.hermesApiKey;
++      if (b.agModel != null && b.agModel !== agent.agModel) {
++        agent.agModel = b.agModel;
++        agent.agConversationId = null;
++        agent.primedSoul = false;
++      }
++      if (b.agApiKey != null) agent.agApiKey = b.agApiKey;
++      if (b.vaultAccess != null) {
++        agent.vaultAccess = agent.vaultAccess || {};
++        if (b.vaultAccess.firebase != null) agent.vaultAccess.firebase = !!b.vaultAccess.firebase;
++      }
++      if (b.isMaster != null) agent.isMaster = !!b.isMaster;
++      if (b.browserOwn != null) agent.browserOwn = !!b.browserOwn;
++      if (b.browserCloud != null) agent.browserCloud = !!b.browserCloud;
++      if (b.browserMyChrome != null) agent.browserMyChrome = !!b.browserMyChrome;
++      if (b.scope != null) agent.scope = String(b.scope || '');
++      if (b.providerLadder != null) agent.providerLadder = b.providerLadder;
++      if (b.autoFailover != null) agent.autoFailover = !!b.autoFailover;
++      if (b.freeAuto != null) agent.freeAuto = !!b.freeAuto;
++      if (b.mixDirectPool != null) agent.mixDirectPool = !!b.mixDirectPool;
++      if (b.ocFreePool != null) agent.ocFreePool = !!b.ocFreePool;
++}
++function applyPendingRuntimeEdits(agent) {
++  const edits = agent.pendingRuntimeEdits || [];
++  agent.pendingRuntimeEdits = [];
++  for (const pending of edits) {
++    if (pending.modelChoice) modelCouncil.applyModelChoice(agent, pending.edit.model || '', modelRoutingDeps());
++    else applyAgentEdit(agent, { ...pending.edit });
++  }
++}
++function isResumeWriterConflict(message) {
++  return /already has an active writer|thread[- ]store conflict|(?:thread|session).*?(?:writer.*?(?:busy|locked)|(?:already|currently) (?:running|in use))/i.test(String(message || ''));
++}
++function preserveConflictedTurn(agent, turn) {
++  const job = turn.queueItem || { id: 'resume-retry-' + randomUUID(), text: turn.text, workflow: turn.workflow, ts: Date.now() };
++  job.resumeConflictAttempts = (job.resumeConflictAttempts || 0) + 1;
++  agent.queue = agent.queue || [];
++  if (!agent.queue.includes(job)) agent.queue.unshift(job);
++  agent.resumeRetryAt = Date.now() + Math.min(30000, 1000 * 2 ** Math.min(5, job.resumeConflictAttempts - 1));
++  pushMsg(agent, { role: 'system', text: 'The provider thread is still in use. Your message is saved at the front of the queue and will retry when the writer is available.' });
++  saveData();
++}
++
+ function trackAgentChild(agent, child) {
++  if (agent.child && agent.child !== child) throw new Error('Agent already owns a child');
++  const turn = agentTurns.get(agent);
++  if (turn) turn.child = child;
+   agent.child = child;
+   agent.activePid = child && child.pid ? Number(child.pid) : 0;
+   agent.activeStartedAt = Date.now();
+@@ -3269,6 +3427,10 @@
+       agent._stallRecoveryExhausted = true;
+     }
+   }
++  const turnAtStop = agentTurns.get(agent);
++  if (turnAtStop) { turnAtStop.cancelled = true; turnAtStop.abort.abort(); }
++  agent.waitingForSlot = false;
++  agent.activityPhase = 'stopping';
+   agent.stopped = true;
+   if (force) {
+     // A full stop is an explicit kill switch: leave queued work durable, but prevent
+@@ -3278,7 +3440,7 @@
+     if (agent.loop) { agent.loop.active = false; agent.loop.reason = 'stopped completely by you'; }
+   }
+   agent.haltQueue = force ? true : !resumeQueue;   // recovery is the only path allowed to drain automatically
+-  const childAtStop = childIsAlive(agent.child) ? agent.child : null;
++  const childAtStop = agent.child || null;
+   const pidsAtStop = [...new Set([childAtStop && childAtStop.pid, agent.activePid].map(Number).filter(Boolean))];
+   const hadAbort = !!agent.apiAbort;
+   // Kill both the live child handle and the persisted PID. The latter is what
+@@ -3289,8 +3451,16 @@
+   const forceIdle = () => {
+     // A worker can disappear before its close callback runs (or after a server restart),
+     // leaving busy=true with no process to kill. Stop must always be able to recover the UI.
++    if (turnAtStop && agentTurns.get(agent) && !ownsTurn(agent, turnAtStop)) return;
+     if (childAtStop && agent.child && agent.child !== childAtStop) return;
++    if (agent.child || childIsAlive({ pid: agent.activePid })) {
++      setTimeout(forceIdle, 250);
++      return;
++    }
++    if (hadAbort && agentTurns.get(agent)) return;
++    if (turnAtStop && ownsTurn(agent, turnAtStop)) turnAtStop.finish();
+     if (!agent.busy && !agent.stopped && !recoveryJob) return;
++    if (hadAbort && agentTurns.get(agent)) return;
+     clearAgentChild(agent);
+     agent.apiAbort = null;
+     agent.busy = false;
+@@ -3401,8 +3571,8 @@
+ }
+ 
+ function processServerQueue(agent) {
+-  if (!agent) return;
+-  const finalized = finalizeActiveAssignment(agent);
++  if (!agent || agentHasTurn(agent) || Number(agent.resumeRetryAt) > Date.now()) return;
++  const finalized = agent.resumeRetryAt ? false : finalizeActiveAssignment(agent);
+   if (finalized) saveData();
+   if (agent.busy || agent.stopped || agent.haltQueue || agent.hardStopped) return;
+ 
+@@ -3441,6 +3611,7 @@
+   // 1) User-queued tasks take priority — run the next one.
+   if (agent.queue && agent.queue.length) {
+     const next = agent.queue.shift();
++    agent.resumeRetryAt = 0;
+     if (next && next.assignmentId) {
+       const cp = accountControl.createAccountControlPlane(state.accountControlPlane);
+       const assignment = cp.workLedger.assignments.find((a) => a.id === next.assignmentId);
+@@ -3462,7 +3633,7 @@
+       ? 'Note — this was queued while you were working; fold it into your flow and continue:\n\n' + next.text
+       : next.text;
+     pushMsg(agent, { role: 'user', text });
+-    try { runTurn(agent, text, dummyRes(), { workflow: next.workflow }); } catch { agent.busy = false; }
++    try { runTurn(agent, text, dummyRes(), { workflow: next.workflow, queueItem: next }); } catch { agent.busy = false; }
+     return;
+   }
+ 
+@@ -3521,20 +3692,41 @@
+   if (agent.ccBaseUrl || agent.ccAuthToken) return null;        // custom endpoint → not Anthropic's per-account limit
+   return 'claude:' + (agent.accountId || 'machine');            // one lane per Claude account (or the machine login)
+ }
+-function acquireClaudeSlot(key) {
+-  if (!key) return Promise.resolve(true);   // not a throttled Claude turn → run immediately
+-  const n = _claudeSlots.get(key) || 0;
+-  if (n < CLAUDE_MAX_CONCURRENT) { _claudeSlots.set(key, n + 1); return Promise.resolve(true); }
+-  return new Promise((resolve) => { const q = _claudeWaiters.get(key) || []; q.push(resolve); _claudeWaiters.set(key, q); });
++function acquireClaudeSlot(key, signal) {
++  if (signal && signal.aborted) return Promise.resolve(false);
++  if (!key) return Promise.resolve(true);
++  return new Promise((resolve) => {
++    const waiter = {
++      grant() { cleanup(); resolve(true); },
++      cancel() {
++        const q = _claudeWaiters.get(key) || [];
++        const index = q.indexOf(waiter);
++        if (index >= 0) q.splice(index, 1);
++        if (!q.length) _claudeWaiters.delete(key);
++        cleanup(); resolve(false);
++      },
++    };
++    function cleanup() { if (signal) signal.removeEventListener('abort', waiter.cancel); }
++    const n = _claudeSlots.get(key) || 0;
++    if (n < CLAUDE_MAX_CONCURRENT) { _claudeSlots.set(key, n + 1); waiter.grant(); }
++    else {
++      const q = _claudeWaiters.get(key) || [];
++      q.push(waiter); _claudeWaiters.set(key, q);
++      if (signal) signal.addEventListener('abort', waiter.cancel, { once: true });
++    }
++  });
+ }
+ function releaseClaudeSlot(key) {
+   if (!key) return;
+   const q = _claudeWaiters.get(key);
+-  if (q && q.length) { const next = q.shift(); next(true); }   // hand the freed slot to the next waiter (count unchanged)
+-  else { _claudeSlots.set(key, Math.max(0, (_claudeSlots.get(key) || 1) - 1)); }
+-}
+-function releaseTurn(agent) {   // release this turn's account slot exactly once
+-  if (agent && agent._thrKey && !agent._thrReleased) { agent._thrReleased = true; releaseClaudeSlot(agent._thrKey); }
++  if (q && q.length) {
++    const next = q.shift();
++    if (!q.length) _claudeWaiters.delete(key);
++    next.grant();
++  } else _claudeSlots.set(key, Math.max(0, (_claudeSlots.get(key) || 0) - 1));
++}
++function releaseTurn(agent, turn = agentTurns.get(agent)) {
++  if (turn && turn.slotHeld) { turn.slotHeld = false; releaseClaudeSlot(turn.slotKey); }
+ }
+ 
+ function announceSkillSelection(agent, task) {
+@@ -3549,6 +3741,51 @@
+ }
+ 
+ function runTurn(agent, text, res, turnOpts = {}) {
++  if (agent.busy || agentHasTurn(agent) || agent.resumeRetryAt) {
++    agent.queue = agent.queue || [];
++    agent.queue.push(turnOpts.queueItem || { id: randomUUID(), text, workflow: turnOpts.workflow, ts: Date.now() });
++    saveData();
++    send(res, { type: 'system', queued: true }); res.end();
++    return;
++  }
++  applyPendingRuntimeEdits(agent);
++  const turn = { text, workflow: turnOpts.workflow, queueItem: turnOpts.queueItem,
++    engine: agent.engine || 'claude-code', abort: new AbortController(), cancelled: false };
++  agentTurns.set(agent, turn);
++  agent.busy = true;
++  agent.stopped = false;
++  agent.waitingForSlot = false;
++  const end = res.end.bind(res);
++  let ended = false;
++  turn.finish = () => {
++    if (ended) return;
++    // A child handle is retained until its close event, even after SIGKILL.
++    if (agent.child) return;
++    ended = true;
++    releaseTurn(agent, turn);
++    if (ownsTurn(agent, turn)) {
++      agentTurns.delete(agent);
++      agent.busy = false;
++      agent.waitingForSlot = false;
++      agent.activityPhase = '';
++      agent.activeTool = null;
++      saveData();
++    }
++    end();
++  };
++  res.end = turn.finish;
++  try {
++    const result = runTurnBody(agent, text, res, turnOpts);
++    if (result && typeof result.catch === 'function') result.catch((error) => {
++      if (!ownsTurn(agent, turn)) return;
++      pushMsg(agent, { role: 'error', text: 'Turn failed: ' + String(error.message || error) });
++      res.end();
++    });
++    return result;
++  } catch (error) { res.end(); throw error; }
++}
++function runTurnBody(agent, text, res, turnOpts = {}) {
++  const turn = agentTurns.get(agent);
+   const isStallRecovery = String(text || '').startsWith(STALL_RECOVERY_MARKER);
+   if (text !== AUTO_CONTINUE_TEXT && !isStallRecovery) {
+     agent._autoContinues = 0;       // a real new task resets the auto-continue budget
+@@ -3618,6 +3855,7 @@
+   const model = agent.ccModel || agent.model;
+ 
+   const launch = (isRetry) => {
++    if (!ownsTurn(agent, turn) || turn.cancelled) { releaseTurn(agent, turn); res.end(); return; }
+     // Persona priming happens through stdin (no shell-quoting headaches).
+     const toSend = buildTurnPrompt(agent, text);
+ 
+@@ -3637,7 +3875,7 @@
+       const errText = 'Failed to start claude: ' + String(e.message || e);
+       send(res, { type: 'error', error: errText });
+       pushMsg(agent, { role: 'error', text: errText });
+-      releaseTurn(agent);
++      releaseTurn(agent, turn);
+       agent.waitingForSlot = false;
+       agent.busy = false;
+       saveData();
+@@ -3654,6 +3892,7 @@
+ 
+     let buf = '';
+     child.stdout.on('data', (chunk) => {
++      if (!ownsTurn(agent, turn) || turn.cancelled || agent.child !== child) return;
+       buf += chunk.toString();
+       let idx;
+       while ((idx = buf.indexOf('\n')) >= 0) {
+@@ -3669,10 +3908,12 @@
+     child.stderr.on('data', (c) => (stderr += c.toString()));
+ 
+     child.on('close', (code) => {
+-      if (buf.trim()) { try { handleEvent(agent, JSON.parse(buf.trim()), res); } catch {} }
++      if (!ownsTurn(agent, turn) || agent.child !== child) return;
++      const wasStopped = turn.cancelled || agent.stopped;
++      if (!wasStopped && buf.trim()) { try { handleEvent(agent, JSON.parse(buf.trim()), res); } catch {} }
+       clearAgentChild(agent, child);
+       agent.waitingForSlot = false;
+-      if (agent.stopped) { send(res, { type: 'system', stopped: true }); pushMsg(agent, { role: 'stopped' }); agent.stopped = false; }
++      if (wasStopped) { send(res, { type: 'system', stopped: true }); pushMsg(agent, { role: 'stopped' }); agent.stopped = false; }
+       else if (code) {
+         const errText = stderr.trim() || `claude exited with code ${code}`;
+         // A resume against a session that doesn't exist in THIS account's profile
+@@ -3686,24 +3927,25 @@
+         send(res, { type: 'error', error: errText });
+         pushMsg(agent, { role: 'error', text: errText });
+       }
+-      releaseTurn(agent);   // free this account's throttle slot for the next queued turn
++      releaseTurn(agent, turn);   // free this account's throttle slot for the next queued turn
+       agent.busy = false;
+       saveData();
+       send(res, { type: 'done' });
+       res.end();
+       // Ended cleanly but mid-task ("I'll continue…")? Resume it ourselves before doing
+       // anything else — otherwise the work silently stalls after you leave the chat.
+-      if (!code && !agent.stopped && maybeAutoContinue(agent)) return;
+-      if (!code) maybeHandoff(agent);   // success → hand result to the next agent in the pipeline
++      if (!code && !wasStopped && !agent.haltQueue && !agent.hardStopped && maybeAutoContinue(agent)) return;
++      if (!code && !wasStopped) maybeHandoff(agent);   // success → hand result to the next agent in the pipeline
+       processServerQueue(agent);   // auto-run the next queued task, client or not
+     });
+ 
+     child.on('error', (err) => {
++      if (!ownsTurn(agent, turn) || agent.child !== child) return;
+       const errText = 'Failed to start claude: ' + err.message;
+       send(res, { type: 'error', error: errText });
+       pushMsg(agent, { role: 'error', text: errText });
+       clearAgentChild(agent, child);
+-      releaseTurn(agent);
++      releaseTurn(agent, turn);
+       agent.waitingForSlot = false;
+       agent.busy = false;
+       saveData();
+@@ -3715,21 +3957,17 @@
+ 
+   // THROTTLE GATE: acquire a slot for this Claude account before spawning (queues if the
+   // account is at capacity, so parallel agents stagger instead of triggering a 429).
+-  agent._thrKey = claudeThrottleKey(agent); agent._thrReleased = false;
++  turn.slotKey = claudeThrottleKey(agent);
+   agent.waitingForSlot = true;
+-  acquireClaudeSlot(agent._thrKey).then(() => {
+-    if (!agents.has(agent.id)) { releaseTurn(agent); return; }
++  acquireClaudeSlot(turn.slotKey, turn.abort.signal).then((granted) => {
++    turn.slotHeld = !!granted;
++    if (!granted || !ownsTurn(agent, turn) || turn.cancelled || !agents.has(agent.id)) {
++      releaseTurn(agent, turn);
++      if (ownsTurn(agent, turn)) res.end();
++      return;
++    }
+     agent.waitingForSlot = false;
+-    // The stall watchdog must measure from launch, not from before the slot wait — otherwise a
+-    // worker that queued >5 min is killed seconds after it starts.
+     agent.lastEventAt = agent.lastProductiveAt = Date.now();
+-    if (agent.stopped) {   // stopped by the user while it was queued → finalize cleanly + free the slot
+-      releaseTurn(agent); agent.busy = false;
+-      try { send(res, { type: 'system', stopped: true }); pushMsg(agent, { role: 'stopped' }); } catch {}
+-      agent.stopped = false;
+-      try { send(res, { type: 'done' }); res.end(); } catch {}
+-      return;
+-    }
+     launch(false);
+   });
+ }
+@@ -4608,6 +4846,7 @@
+ // `codex exec`. Auth via OPENAI_API_KEY (or the CLI's own ChatGPT login if no key set).
+ // JSONL event schema varies across Codex versions, so parsing is intentionally lenient.
+ async function runCodexTurn(agent, text, res) {
++  const turn = agentTurns.get(agent);
+   agent.busy = true;
+   res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Cache-Control': 'no-cache' });
+ 
+@@ -4657,6 +4896,7 @@
+   //     prompt as a command-line argument blew Windows' ~32KB argv limit and spawn() threw
+   //     ENAMETOOLONG. Fix: pipe the prompt through STDIN (verified good with a 75KB prompt).
+   const exePath = await resolveCodexExe();
++  if (!ownsTurn(agent, turn) || turn.cancelled) { res.end(); return; }
+   let child;
+   try {
+     child = exePath
+@@ -4680,9 +4920,12 @@
+   // items become assistant text; command/file items become tool cards; a genuine turn failure
+   // becomes an error; everything else is dropped.
+   let realFailure = '';
++  let turnFailed = false;
++  let producedWork = false;
+   let childLaunchError = false;
+   const NOISE = /skill descriptions were shortened|reading additional input from stdin|falling back from websockets|reconnecting\.\.\.|dangerously-bypass-hook-trust.*enabled/i;
+   const handleEvt = (evt) => {
++    if (!ownsTurn(agent, turn) || turn.cancelled || agent.child !== child) return;
+     agent.lastEventAt = Date.now();
+     const kind = evt.type || '';
+     if (kind === 'thread.started') {
+@@ -4694,11 +4937,13 @@
+       const item = evt.item || {};
+       const itype = item.type || '';
+       if (itype === 'agent_message' && item.text && item.text.trim()) {
++        producedWork = true;
+         // The FINAL reply — replace, don't append (started/updated/completed repeat the same item).
+         agent.activityPhase = 'writing';
+         agent.lastProductiveAt = Date.now();
+         if (kind === 'item.completed') { send(res, { type: 'text', text: item.text }); pushMsg(agent, { role: 'assistant', text: item.text }); }
+       } else if (/command|exec|tool|patch|file|apply/i.test(itype)) {
++        producedWork = true;
+         const label = item.command || item.title || itype;
+         agent.activityPhase = 'tool';
+         agent.lastProductiveAt = Date.now();
+@@ -4715,8 +4960,10 @@
+       }
+       // reasoning / other item types: intentionally dropped
+     } else if (kind === 'error' && evt.message && !NOISE.test(String(evt.message))) {
++      if (isResumeWriterConflict(evt.message)) turnFailed = true;
+       realFailure = typeof evt.message === 'string' ? evt.message : JSON.stringify(evt.message);
+     } else if (kind === 'turn.failed') {
++      turnFailed = true;
+       realFailure = (evt.error && (evt.error.message || JSON.stringify(evt.error))) || 'the turn failed';
+     }
+     // thread.started / turn.started / turn.completed / usage: ignored
+@@ -4740,11 +4987,19 @@
+   child.stderr.on('data', (c) => (stderr += c.toString()));
+ 
+   child.on('close', (code) => {
++    if (!ownsTurn(agent, turn) || agent.child !== child) return;
+     if (buf.trim()) { try { handleEvt(JSON.parse(buf.trim())); } catch {} }
+     // A Stop failsafe may already have detached this worker, and a new turn may now own the
+     // agent. Never let the late close from the old process mark the new turn idle.
+     if (childLaunchError || agent.child !== child) { return; }
+     clearAgentChild(agent, child);
++    const failure = realFailure || stderr.trim();
++    if (!turn.cancelled && !agent.stopped && !producedWork && (turnFailed || code) && isResumeWriterConflict(failure)) {
++      preserveConflictedTurn(agent, turn);
++      send(res, { type: 'system', retrying: true });
++      send(res, { type: 'done' }); res.end();
++      return;
++    }
+     if (agent.stopped && !agent._recoveringStall) { send(res, { type: 'system', stopped: true }); pushMsg(agent, { role: 'stopped' }); agent.stopped = false; }
+     else if (realFailure) { send(res, { type: 'error', error: realFailure }); pushMsg(agent, { role: 'error', text: realFailure }); }
+     else if (code && code !== 0) { const msg = (stderr.trim() && !NOISE.test(stderr) ? stderr.trim() : '') || `codex exited with code ${code}`; send(res, { type: 'error', error: msg }); pushMsg(agent, { role: 'error', text: msg }); }
+@@ -4762,7 +5017,7 @@
+   });
+ 
+   child.on('error', (err) => {
+-    if (agent.child !== child) return;
++    if (!ownsTurn(agent, turn) || agent.child !== child) return;
+     childLaunchError = true;
+     const msg = 'Failed to start codex: ' + err.message;
+     send(res, { type: 'error', error: msg }); pushMsg(agent, { role: 'error', text: msg });
+@@ -7413,7 +7668,7 @@
+       const b = await readBody(req);
+       const text = (b.text || '').trim();
+       if (!text) return json(res, 400, { error: 'empty message' });
+-      if (agent.busy) return json(res, 409, { error: 'agent is busy' });
++      if (agent.busy || agentHasTurn(agent)) return json(res, 409, { error: 'agent is busy' });
+       // A new, explicit user message is the deliberate resume gesture after the
+       // emergency kill switch. Queued work remains frozen until then.
+       if (agent.hardStopped) {
+@@ -7435,6 +7690,10 @@
+       const b = await readBody(req);
+       // One picker for Claude AND OpenAI models: an OpenAI id moves the agent to Codex, a Claude
+       // id moves it back to Claude Code, with the conversation handed over (model-council.js).
++      if (queueRuntimeEdit(agent, b, true)) {
++        saveData();
++        return json(res, 200, publicAgent(agent));
++      }
+       const note = modelCouncil.applyModelChoice(agent, b.model || '', modelRoutingDeps());
+       if (note) pushMsg(agent, { role: 'system', text: '🔧 ' + note });
+       saveData();
+@@ -7442,115 +7701,8 @@
+     }
+     if (m[2] === '/edit' && method === 'POST') {
+       const b = await readBody(req);
+-      modelCouncil.normalizeAgentBody(agent, b, modelRoutingDeps());   // an OpenAI id in `model` = run on Codex
+-      const oldNames = new Set([agent.name, agent.role].filter(Boolean));
+-      if (b.name != null) agent.name = b.name;
+-      if (b.role != null) agent.role = b.role;
+-      // A rename keeps the team intact: teammates who reported to the old name report to the new
+-      // one — unless another agent in the project still answers to the old name.
+-      const newName = agent.role || agent.name;
+-      if ((b.name != null || b.role != null) && newName && !oldNames.has(newName)) {
+-        const mates = [...agents.values()].filter((o) => o !== agent && o.projectId === agent.projectId);
+-        for (const old of oldNames) {
+-          if (mates.some((o) => o.name === old || o.role === old)) continue;
+-          for (const o of mates) if (o.reportsTo === old) o.reportsTo = newName;
+-        }
+-      }
+-      if (b.reportsTo != null) agent.reportsTo = b.reportsTo;
+-      if (b.connections != null) agent.connections = b.connections;
+-      if (b.order != null) agent.order = b.order;
+-      if (b.handoffTo != null) agent.handoffTo = b.handoffTo;
+-      if (b.playbooks != null) { agent.playbooks = b.playbooks; agent.primedSoul = false; }
+-      if (b.useAllSkills != null) { agent.useAllSkills = !!b.useAllSkills; agent.primedSoul = false; }
+-      if (b.workflowMode != null) { agent.workflowMode = normalizeWorkflow(b.workflowMode); }
+-      if (b.collaborators != null) { agent.collaborators = b.collaborators; agent.primedSoul = false; }
+-      const codexModelChanging = b.codexModel != null && b.codexModel !== agent.codexModel;
+-      const accountChanging = b.accountId != null && b.accountId !== agent.accountId;
+-      const engineChanging = b.engine != null && b.engine !== agent.engine;
+-      if (accountChanging || engineChanging) {
+-        queueHistoryBridge(agent, (engineChanging ? (agent.engine + ' to ' + b.engine) : 'account change') + ' handoff');
+-        agent.primedSoul = false;
+-      }
+-      if (!accountChanging && !engineChanging && (agent.engine === 'codex' || b.engine === 'codex') && codexModelChanging) {
+-        queueHistoryBridge(agent, 'Codex model change from ' + (agent.codexModel || 'default') + ' to ' + (b.codexModel || 'default'));
+-        agent.primedSoul = false;
+-      }
+-      if (accountChanging) {
+-        // Switching account = different login/profile, each with its OWN sessions.
+-        // Stash the CURRENT account's session so returning to it later resumes the same
+-        // chat, then restore the target account's last session if we have one. This is
+-        // what stops the "switched accounts and it forgot everything" data loss.
+-        const nextEngine = b.engine || agent.engine || 'claude-code';
+-        if (nextEngine === 'claude-code') {
+-          if (!agent.sessionsByAccount) agent.sessionsByAccount = {};
+-          if (agent.sessionId) agent.sessionsByAccount[acctKey(agent)] = agent.sessionId;   // outgoing
+-          agent.accountId = b.accountId;
+-          agent.sessionId = agent.sessionsByAccount[acctKey(agent)] || null;                 // incoming
+-          agent.primedSoul = !!agent.sessionId;
+-        } else {
+-          agent.accountId = b.accountId;
+-          agent.primedSoul = false;  // the selected engine restores its own account session
+-        }
+-      }
+-      if (b.soul != null && b.soul !== agent.soul) { agent.soul = b.soul; agent.primedSoul = false; }
+-      if (b.approach != null && b.approach !== agent.approach) { agent.approach = b.approach; agent.primedSoul = false; }
+-      if (b.values != null && b.values !== agent.values) { agent.values = b.values; agent.primedSoul = false; }
+-      if (b.effort != null) agent.effort = b.effort;
+-      // Working directory: settable after creation. It used to be fixed at create time from the
+-      // project's cwd, so an agent pointed at the wrong folder could never be moved without being
+-      // rebuilt. Only an existing directory is accepted - a typo here would strand every turn.
+-      if (b.cwd != null) {
+-        const next = String(b.cwd || '').trim();
+-        if (next && next !== agent.cwd) {
+-          let ok = false;
+-          try { ok = fs.existsSync(next) && fs.statSync(next).isDirectory(); } catch {}
+-          if (ok) { agent.cwd = next; agent.primedSoul = false; }
+-        }
+-      }
+-      // The worker editor saves the whole form in one POST, model included. Without this the
+-      // model select silently did nothing on an existing agent (only /model applied it), so an
+-      // agent could keep a model string belonging to a different engine after an engine switch.
+-      if (b.model != null && b.model !== agent.model) {
+-        agent.model = b.model;
+-        pushMsg(agent, { role: 'system', text: '🔧 Model switched to ' + (agent.model || 'account default') + '. Takes effect on your next message — the run will report the exact model it loads.' });
+-      }
+-      if (engineChanging) { agent.engine = b.engine; agent.primedSoul = false; }
+-      if (b.apiBaseUrl != null) agent.apiBaseUrl = b.apiBaseUrl;
+-      if (b.apiKey != null) agent.apiKey = b.apiKey;
+-      if (b.apiModel != null) agent.apiModel = b.apiModel;
+-      if (b.ccBaseUrl != null) agent.ccBaseUrl = b.ccBaseUrl;
+-      if (b.ccAuthToken != null) agent.ccAuthToken = b.ccAuthToken;
+-      if (b.ccModel != null) agent.ccModel = b.ccModel;
+-      if (b.ccOauthToken != null) agent.ccOauthToken = b.ccOauthToken;
+-      if (b.ocProvider != null) agent.ocProvider = b.ocProvider;
+-      if (b.ocModel != null) agent.ocModel = b.ocModel;
+-      if (b.ocApiKey != null) agent.ocApiKey = b.ocApiKey;
+-      if (b.codexModel != null) agent.codexModel = b.codexModel;
+-      if (b.codexReasoningEffort != null) agent.codexReasoningEffort = b.codexReasoningEffort;
+-      if (b.codexApiKey != null) agent.codexApiKey = b.codexApiKey;
+-      if (b.hermesProvider != null) agent.hermesProvider = b.hermesProvider;
+-      if (b.hermesModel != null) agent.hermesModel = b.hermesModel;
+-      if (b.hermesApiKey != null) agent.hermesApiKey = b.hermesApiKey;
+-      if (b.agModel != null && b.agModel !== agent.agModel) {
+-        agent.agModel = b.agModel;
+-        agent.agConversationId = null;
+-        agent.primedSoul = false;
+-      }
+-      if (b.agApiKey != null) agent.agApiKey = b.agApiKey;
+-      if (b.vaultAccess != null) {
+-        agent.vaultAccess = agent.vaultAccess || {};
+-        if (b.vaultAccess.firebase != null) agent.vaultAccess.firebase = !!b.vaultAccess.firebase;
+-      }
+-      if (b.isMaster != null) agent.isMaster = !!b.isMaster;
+-      if (b.browserOwn != null) agent.browserOwn = !!b.browserOwn;
+-      if (b.browserCloud != null) agent.browserCloud = !!b.browserCloud;
+-      if (b.browserMyChrome != null) agent.browserMyChrome = !!b.browserMyChrome;
+-      if (b.scope != null) agent.scope = String(b.scope || '');
+-      if (b.providerLadder != null) agent.providerLadder = b.providerLadder;
+-      if (b.autoFailover != null) agent.autoFailover = !!b.autoFailover;
+-      if (b.freeAuto != null) agent.freeAuto = !!b.freeAuto;
+-      if (b.mixDirectPool != null) agent.mixDirectPool = !!b.mixDirectPool;
+-      if (b.ocFreePool != null) agent.ocFreePool = !!b.ocFreePool;
++      queueRuntimeEdit(agent, b);
++      applyAgentEdit(agent, b);
+       saveData();
+       return json(res, 200, publicAgent(agent));
+     }
+@@ -7818,7 +7970,7 @@
+       if (!a.busy) { a._staleTicks = 0; continue; }
+       const childEngine = (a.engine || 'claude-code') !== 'api';
+       // Case 1: flagged busy but the process is gone (turn ended without clearing busy).
+-      if (childEngine && !childIsAlive(a.child) && !a.waitingForSlot) {
++      if (childEngine && !agentHasTurn(a) && !a.waitingForSlot) {
+         a._staleTicks = (a._staleTicks || 0) + 1;
+         if (a._staleTicks >= 6) {                 // ~9s with no live process
+           a._staleTicks = 0; a.busy = false; saveData();
